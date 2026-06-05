@@ -198,6 +198,19 @@ def read_front_camera_task():
 def read_back_camera_task():
     read_single_camera(back_camera_sock, "Back Camera", 'latest_back_frame')
 
+def find_largest_token(frame, mask, min_area=300):
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    largest = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(largest) < min_area:
+        return None
+
+    x, y, w, h = cv2.boundingRect(largest)
+    return (x, y, w, h), largest
+
+
 def processing_task():
     #This is where you write your image processing code to decide how to control the car
     #You can use libraries like OpenCV to process the image
@@ -205,10 +218,80 @@ def processing_task():
     #Remember to use the shared_data to get the latest frame
     with data_lock:
         front_frame = shared_data['latest_front_frame']
-    
-    if front_frame is not None:
-        # write your processing here
-        pass
+
+    if front_frame is None:
+        return
+
+    hsv = cv2.cvtColor(front_frame, cv2.COLOR_BGR2HSV)
+    green_mask = cv2.inRange(
+        hsv,
+        np.array([40, 50, 50]),
+        np.array([90, 255, 255])
+    )
+
+    detection = find_largest_token(front_frame, green_mask, min_area=200)
+    steering = 0.0
+    acceleration = 1.0
+    image_center = front_frame.shape[1] // 2
+
+    if detection is not None:
+        (x, y, w, h), largest = detection
+        center_x = x + w // 2
+        error = float(center_x - image_center) / image_center
+
+        STEERING_INVERT = False
+        steer_gain = 0.8
+        steering = error * steer_gain
+        if STEERING_INVERT:
+            steering = -steering
+
+        steering = max(-1.0, min(1.0, steering))
+
+        cv2.rectangle(
+            front_frame,
+            (x, y),
+            (x + w, y + h),
+            (0, 255, 0),
+            2
+        )
+        cv2.circle(front_frame, (center_x, y + h // 2), 5, (0, 255, 0), -1)
+        cv2.putText(
+            front_frame,
+            f"Token error={error:.2f} steer={steering:.2f}",
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 0),
+            2
+        )
+    else:
+        steering = 0.0
+        acceleration = 0.8
+        cv2.putText(
+            front_frame,
+            "No green token detected",
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 0, 255),
+            2
+        )
+
+    cv2.line(
+        front_frame,
+        (image_center, 0),
+        (image_center, front_frame.shape[0]),
+        (255, 0, 0),
+        2
+    )
+
+    cv2.imshow("Green Mask", green_mask)
+    cv2.imshow("AI Debug", front_frame)
+    cv2.waitKey(1)
+
+    with data_lock:
+        shared_data['steering_input'] = steering
+        shared_data['acceleration_input'] = acceleration
 
 def send_controls_task():
     #This is where you send the control commands to the car using the control_conn
@@ -220,8 +303,11 @@ def send_controls_task():
     #steering_input: -1.0 to 1.0 (left to right)
     #acceleration_input: -1.0 to 1.0 (reverse to forward)
     #this example always accelerate forward
-    steering_input = 0.0
-    acceleration_input = 1.0
+    # steering_input = 0.0
+    # acceleration_input = 1.0
+    with data_lock:
+        steering_input = shared_data['steering_input']
+        acceleration_input = shared_data['acceleration_input']
 
     try:
         # Pack and send the control command
@@ -250,8 +336,8 @@ if __name__ == '__main__':
     # Concurrency refers to the number of instances of the task that can run at the same time
     t_front_camera = RTTask("ReadFrontCamera", period=0.005, priority=TaskPriority.HIGH, execute_func=read_front_camera_task)
     t_back_camera = RTTask("ReadBackCamera", period=0.005, priority=TaskPriority.HIGH, execute_func=read_back_camera_task)
-    t_processing = RTTask("Processing", period=0.005, priority=TaskPriority.MEDIUM, execute_func=processing_task)
-    t_controls = RTTask("SendControls", period=0.005, priority=TaskPriority.HIGH, execute_func=send_controls_task)
+    t_processing = RTTask("Processing", period=0.05, priority=TaskPriority.MEDIUM, execute_func=processing_task)
+    t_controls = RTTask("SendControls", period=0.05, priority=TaskPriority.HIGH, execute_func=send_controls_task)
     
     # Start tasks to run concurrently
     t_front_camera.start()
