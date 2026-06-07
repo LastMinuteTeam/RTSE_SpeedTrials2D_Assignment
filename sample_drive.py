@@ -193,8 +193,8 @@ def processing_task():
     try: front_frame = front_frame_queue.get_nowait()
     except queue.Empty: pass
     
-    try: back_frame = back_frame_queue.get_nowait()
-    except queue.Empty: pass
+    # try: back_frame = back_frame_queue.get_nowait()
+    # except queue.Empty: pass
     
     acceleration_input = 1.0 
     rear_danger = False      
