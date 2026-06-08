@@ -90,6 +90,8 @@ HAZARD_SIZE_PRIORITY_WEIGHT = 0.90
 GREEN_FRONT_PRIORITY_WINDOW = 0.12
 GREEN_SIZE_PRIORITY_WEIGHT = 0.75
 GREEN_FRONT_PRIORITY_ADVANTAGE = 0.04
+PATH_RELEASE_CENTER_THRESHOLD = 0.15
+PATH_LOST_TIMEOUT = 0.75
 ROAD_BOUNDARY_ROW_BAND = 6
 ROAD_BOUNDARY_MARGIN_PIXELS = 6
 
@@ -650,7 +652,100 @@ def choose_hazard_avoidance(tokens, path_center):
 
 
 def get_stable_path(path_choice, green_still_visible, hazard_still_blocking):
-    return dict(path_choice) if path_choice is not None else None
+    current_time = time.time()
+
+    if not hasattr(get_stable_path, "held_path"):
+        get_stable_path.held_path = None
+        get_stable_path.last_seen_time = 0.0
+        get_stable_path.green_centered = False
+        get_stable_path.state_label = "released"
+
+    def path_sign(target_x):
+        if target_x > 0.0:
+            return 1
+        if target_x < 0.0:
+            return -1
+        return 0
+
+    held_path = get_stable_path.held_path
+
+    if (
+        held_path is not None and
+        held_path.get('mode') == 'green' and
+        path_choice is not None and
+        path_choice.get('mode') == 'avoid' and
+        hazard_still_blocking
+    ):
+        get_stable_path.held_path = dict(path_choice)
+        get_stable_path.last_seen_time = current_time
+        get_stable_path.green_centered = False
+        get_stable_path.state_label = "locked-avoid"
+        return get_stable_path.held_path
+
+    if held_path is not None and held_path.get('mode') == 'avoid' and not hazard_still_blocking:
+        get_stable_path.held_path = None
+        get_stable_path.green_centered = False
+        get_stable_path.state_label = "released"
+        held_path = None
+
+    if held_path is not None and held_path.get('mode') == 'green':
+        if not get_stable_path.green_centered and abs(held_path['target_x']) <= PATH_RELEASE_CENTER_THRESHOLD:
+            get_stable_path.green_centered = True
+
+        if get_stable_path.green_centered:
+            if green_still_visible:
+                get_stable_path.state_label = "locked-green-hold"
+                if path_choice is not None and path_choice.get('mode') == 'green':
+                    get_stable_path.held_path = dict(path_choice)
+                    get_stable_path.last_seen_time = current_time
+                    held_path = get_stable_path.held_path
+                return held_path
+
+            get_stable_path.held_path = None
+            get_stable_path.green_centered = False
+            get_stable_path.state_label = "released"
+            held_path = None
+
+    if held_path is None:
+        if path_choice is not None:
+            get_stable_path.held_path = dict(path_choice)
+            get_stable_path.last_seen_time = current_time
+            get_stable_path.green_centered = False
+            get_stable_path.state_label = "locked-green-move" if path_choice.get('mode') == 'green' else "locked-avoid"
+            return get_stable_path.held_path
+        get_stable_path.state_label = "released"
+        return None
+
+    if path_choice is not None:
+        same_mode = path_choice.get('mode') == held_path.get('mode')
+        same_side = path_sign(path_choice['target_x']) == path_sign(held_path['target_x'])
+        if same_mode and same_side:
+            get_stable_path.held_path = dict(path_choice)
+            get_stable_path.last_seen_time = current_time
+            if get_stable_path.held_path.get('mode') == 'green':
+                if not get_stable_path.green_centered and abs(get_stable_path.held_path['target_x']) <= PATH_RELEASE_CENTER_THRESHOLD:
+                    get_stable_path.green_centered = True
+                get_stable_path.state_label = "locked-green-hold" if get_stable_path.green_centered else "locked-green-move"
+            else:
+                get_stable_path.state_label = "locked-avoid"
+            return get_stable_path.held_path
+        if held_path.get('mode') == 'green':
+            get_stable_path.state_label = "locked-green-hold" if get_stable_path.green_centered else "locked-green-move"
+        else:
+            get_stable_path.state_label = "locked-avoid"
+        return held_path
+
+    if (current_time - get_stable_path.last_seen_time) <= PATH_LOST_TIMEOUT:
+        if held_path.get('mode') == 'green':
+            get_stable_path.state_label = "locked-green-hold" if get_stable_path.green_centered else "locked-green-move"
+        else:
+            get_stable_path.state_label = "locked-avoid"
+        return held_path
+
+    get_stable_path.held_path = None
+    get_stable_path.green_centered = False
+    get_stable_path.state_label = "released"
+    return None
 
 
 def get_road_bounds_at_target_row(road_mask, target_y_norm):
@@ -754,6 +849,8 @@ def analyse_drive(front_frame):
     target_choice = apply_boundary_fallback(target_choice, road_mask, width)
     focused_hazards = hazard_choice['focused_hazards'] if hazard_choice is not None else []
     focused_greens = green_choice['focused_tokens'] if green_choice is not None else []
+    path_lock_state = getattr(get_stable_path, "state_label", "released")
+
     drive_mode = 'path'
     steering = 0.0
 
@@ -850,7 +947,7 @@ def analyse_drive(front_frame):
 
     cv2.putText(
         debug_frame,
-        f"mode={drive_mode} steer={sent_steering:+.2f} accel={sent_acceleration:.2f}",
+        f"mode={drive_mode} steer={sent_steering:+.2f} accel={sent_acceleration:.2f} path={path_lock_state}",
         (10, 28),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.55,
