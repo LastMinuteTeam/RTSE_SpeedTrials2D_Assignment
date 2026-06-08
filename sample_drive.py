@@ -270,11 +270,11 @@ def read_single_camera(sock, window_name, data_key):
 
 
 def read_front_camera_task():
-    read_single_camera(front_camera_sock, "Front Camera", front_frame_queue)
+    read_single_camera(front_camera_sock, "Front Camera", 'latest_front_frame')
 
 
 def read_back_camera_task():
-    read_single_camera(back_camera_sock, "Back Camera", back_frame_queue)
+    read_single_camera(back_camera_sock, "Back Camera", 'latest_back_frame')
 
 def find_largest_token(frame, mask, min_area=300):
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
