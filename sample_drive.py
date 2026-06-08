@@ -7,8 +7,10 @@ import time
 import keyboard
 import select
 import ctypes
-import queue
 
+# ---------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------
 CAMERA_HOST = '127.0.0.1'
 FRONT_CAMERA_PORT = 8080
 BACK_CAMERA_PORT = 8082
@@ -94,14 +96,9 @@ ROAD_BOUNDARY_ROW_BAND = 6
 ROAD_BOUNDARY_MARGIN_PIXELS = 6
 
 
-steer_state = {
-    'status': 'IDLE',          
-    'tap_duration': 0.25,     
-    'cooldown_duration': 0.05, 
-    'end_time': 0.0,
-    'active_steer': 0.0
-}
-
+# ---------------------------------------------------------
+# Real-Time Scheduling Framework (Do not change this in your code)
+# ---------------------------------------------------------
 class TaskPriority:
     HIGH = 1
     MEDIUM = 2
@@ -109,6 +106,12 @@ class TaskPriority:
 
 
 class RTTask(threading.Thread):
+    """
+    Real-Time Task implementing:
+    - Concurrency (inherits threading.Thread)
+    - Task Period (enforced in run loop)
+    - Task Priority (logical priority assigned)
+    """
     def __init__(self, name, period, priority, execute_func):
         super().__init__()
         self.name = name
@@ -251,7 +254,6 @@ def read_single_camera(sock, window_name, data_key):
         if latest_frame_data is not None:
             np_arr = np.frombuffer(latest_frame_data, np.uint8)
             frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-            
             if frame is not None:
                 with data_lock:
                     shared_data[data_key] = frame
@@ -272,24 +274,11 @@ def read_single_camera(sock, window_name, data_key):
 
 
 def read_front_camera_task():
-    read_single_camera(front_camera_sock, "Front Camera", front_frame_queue)
+    read_single_camera(front_camera_sock, "Front Camera", 'latest_front_frame')
 
 
 def read_back_camera_task():
-    read_single_camera(back_camera_sock, "Back Camera", back_frame_queue)
-
-def find_largest_token(frame, mask, min_area=300):
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
-
-    largest = max(contours, key=cv2.contourArea)
-    if cv2.contourArea(largest) < min_area:
-        return None
-
-    x, y, w, h = cv2.boundingRect(largest)
-    return (x, y, w, h), largest
-
+    read_single_camera(back_camera_sock, "Back Camera", 'latest_back_frame')
 
 
 def clamp(value, minimum, maximum):
@@ -1092,6 +1081,9 @@ def send_controls_task():
         control_conn = None
 
 
+# ---------------------------------------------------------
+# Main (Scheduler Initialization)
+# ---------------------------------------------------------
 if __name__ == '__main__':
     print("Initializing RTSE Sample Drive...")
 
