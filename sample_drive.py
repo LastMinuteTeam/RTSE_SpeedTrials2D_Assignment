@@ -186,6 +186,19 @@ def read_front_camera_task():
 def read_back_camera_task():
     read_single_camera(back_camera_sock, "Back Camera", back_frame_queue)
 
+def find_largest_token(frame, mask, min_area=300):
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    largest = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(largest) < min_area:
+        return None
+
+    x, y, w, h = cv2.boundingRect(largest)
+    return (x, y, w, h), largest
+
+
 def processing_task():
     front_frame = None
     back_frame = None
