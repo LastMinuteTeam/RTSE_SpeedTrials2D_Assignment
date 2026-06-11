@@ -536,6 +536,74 @@ def choose_green_target(tokens, path_center):
         'focused_tokens': [entry['token'] for entry in focused_targets]
     }
 
+def get_lane_index(norm_x, norm_y, road_mask, frame_width, frame_height, roi_top, left_poly=None, right_poly=None):
+    """
+    Calculates the lane dynamically. Uses Mathematical Polynomials if available 
+    for perfect curves, otherwise falls back to raw pixel scanning.
+    """
+    y_px = int(norm_y * frame_height)
+    roi_y = y_px - roi_top
+    
+    if roi_y < 0 or roi_y >= road_mask.shape[0]:
+        return 3 
+        
+    if left_poly is not None and right_poly is not None:
+        left_px = int(left_poly(roi_y))
+        right_px = int(right_poly(roi_y))
+    else:
+        row_pixels = road_mask[roi_y, :]
+        occupied_columns = np.where(row_pixels > 0)[0]
+        if occupied_columns.size == 0:
+            return 3
+        left_px = int(occupied_columns[0])
+        right_px = int(occupied_columns[-1])
+        
+    road_width = right_px - left_px
+    if road_width <= 0: return 3
+    
+    px_x = ((norm_x + 1.0) * 0.5) * frame_width
+    relative_pos = (px_x - left_px) / float(road_width)
+    
+    if relative_pos < 0.20: return 1
+    elif relative_pos < 0.40: return 2
+    elif relative_pos < 0.60: return 3
+    elif relative_pos < 0.80: return 4
+    else: return 5
+
+def check_edge_lane_escape(tokens, path_center, road_mask, frame_width, frame_height, roi_top, left_poly=None, right_poly=None):
+    current_lane = get_lane_index(path_center, 0.95, road_mask, frame_width, frame_height, roi_top, left_poly, right_poly)
+    
+    if current_lane not in [1, 5]:
+        return None
+        
+    for token in tokens['red']:
+        if token['norm_y'] < HAZARD_MIN_Y:
+            continue
+            
+        token_lane = get_lane_index(token['norm_x'], token['norm_y'], road_mask, frame_width, frame_height, roi_top, left_poly, right_poly)
+        
+        if token_lane == current_lane:
+            if current_lane == 1:
+                return {
+                    'mode': 'avoid',
+                    'target_x': -0.35, 
+                    'target_y': 0.72,
+                    'strength': 1.0, 
+                    'focused_hazards': [],
+                    'gap_centers': [-0.35],
+                    'is_edge_escape': True 
+                }
+            elif current_lane == 5:
+                return {
+                    'mode': 'avoid',
+                    'target_x': 0.35, 
+                    'target_y': 0.72,
+                    'strength': 1.0,
+                    'focused_hazards': [],
+                    'gap_centers': [0.35],
+                    'is_edge_escape': True 
+                }
+    return None
 
 def choose_hazard_avoidance(tokens, path_center):
     blocking_hazards = []
@@ -807,15 +875,17 @@ def analyse_drive(front_frame):
     roi = front_frame[roi_top:, :]
     roi_height, roi_width = roi.shape[:2]
 
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(gray, EDGE_LOW, EDGE_HIGH)
-
-    _, bright_mask = cv2.threshold(gray, PATH_THRESHOLD, 255, cv2.THRESH_BINARY)
-    path_mask = cv2.bitwise_or(edges, bright_mask)
-    kernel = np.ones((5, 5), np.uint8)
+    hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    
+    lower_track = np.array([0, 0, 35])     
+    upper_track = np.array([180, 40, 120]) 
+    
+    path_mask = cv2.inRange(hsv_roi, lower_track, upper_track)
+    
+    kernel = np.ones((7, 7), np.uint8)
     path_mask = cv2.morphologyEx(path_mask, cv2.MORPH_CLOSE, kernel)
-    path_mask = cv2.dilate(path_mask, kernel, iterations=1)
+    path_mask = cv2.dilate(path_mask, kernel, iterations=2)
+    
     road_mask = build_road_mask(path_mask)
 
     center_x = roi_width // 2
@@ -826,13 +896,37 @@ def analyse_drive(front_frame):
         sent_steering = shared_data['sent_steering_input']
         sent_acceleration = shared_data['sent_acceleration_input']
     tokens = find_tokens(front_frame, road_mask, roi_top, lane_left_norm, lane_right_norm)
+    
+    points_y = []
+    left_points_x = []
+    right_points_x = []
+    
+    for current_y in range(roi_height - 1, 0, -5):
+        row_pixels = road_mask[current_y, :]
+        occupied = np.where(row_pixels > 0)[0]
+        if occupied.size > 0:
+            points_y.append(current_y)
+            left_points_x.append(occupied[0])
+            right_points_x.append(occupied[-1])
+
+    left_poly = None
+    right_poly = None
+    
+    if len(points_y) > 10:
+        left_poly = np.poly1d(np.polyfit(points_y, left_points_x, 2))
+        right_poly = np.poly1d(np.polyfit(points_y, right_points_x, 2))
+
+    edge_escape_choice = check_edge_lane_escape(tokens, path_center, road_mask, width, height, roi_top, left_poly, right_poly)
+    
     green_choice = choose_green_target(tokens, path_center)
     hazard_choice = choose_hazard_avoidance(tokens, path_center)
 
     green_front_priority = green_choice.get('front_priority_score', -1.0) if green_choice is not None else -1.0
     hazard_front_priority = hazard_choice.get('front_priority_score', -1.0) if hazard_choice is not None else -1.0
 
-    if (
+    if edge_escape_choice is not None:
+        raw_path_choice = edge_escape_choice
+    elif (
         hazard_choice is not None and
         hazard_choice['strength'] >= HAZARD_OVERRIDE_THREAT and
         hazard_front_priority >= (green_front_priority + GREEN_FRONT_PRIORITY_ADVANTAGE)
@@ -870,6 +964,39 @@ def analyse_drive(front_frame):
     debug_frame = front_frame.copy()
     cv2.rectangle(debug_frame, (0, roi_top), (width - 1, height - 1), (80, 80, 80), 2)
     cv2.line(debug_frame, (center_x, roi_top), (center_x, height - 1), (255, 0, 0), 2)
+    
+    hsv_debug = cv2.cvtColor(front_frame, cv2.COLOR_BGR2HSV)
+    
+    lower_grey = np.array([0, 0, 85])
+    upper_grey = np.array([180, 40, 110])
+    lane_mask_debug = cv2.inRange(hsv_debug, lower_grey, upper_grey)
+    
+    lane_on_road = np.zeros_like(lane_mask_debug)
+    lane_on_road[roi_top:, :] = cv2.bitwise_and(lane_mask_debug[roi_top:, :], road_mask)
+    debug_frame[lane_on_road > 0] = [255, 255, 0]
+
+    if left_poly is not None and right_poly is not None:
+        prev_dividers = None
+        for roi_y in range(roi_height - 1, 0, -15):
+            fit_left_x = left_poly(roi_y)
+            fit_right_x = right_poly(roi_y)
+            road_width = fit_right_x - fit_left_x
+
+            if road_width > 20: 
+                current_dividers = [
+                    int(fit_left_x + road_width * 0.20),
+                    int(fit_left_x + road_width * 0.40),
+                    int(fit_left_x + road_width * 0.60),
+                    int(fit_left_x + road_width * 0.80)
+                ]
+                
+                screen_y = roi_top + roi_y 
+                
+                if prev_dividers:
+                    for i in range(4):
+                        cv2.line(debug_frame, (prev_dividers[i], screen_y + 15), (current_dividers[i], screen_y), (200, 200, 200), 1)
+                prev_dividers = current_dividers
+
     road_overlay = cv2.cvtColor(road_mask, cv2.COLOR_GRAY2BGR)
     road_overlay[:, :, 0] = 0
     road_overlay[:, :, 2] = 0
@@ -956,6 +1083,18 @@ def analyse_drive(front_frame):
         cv2.LINE_AA
     )
 
+    if edge_escape_choice is not None:
+        cv2.putText(
+            debug_frame,
+            "!!! EMERGENCY EDGE ESCAPE !!!",
+            (width // 2 - 140, 80),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (0, 0, 255), 
+            2,
+            cv2.LINE_AA
+        )
+
     cv2.putText(
         debug_frame,
         "Blue=center  Green path=target  Green/Yellow/Red/Gray=detected objects",
@@ -967,12 +1106,17 @@ def analyse_drive(front_frame):
         cv2.LINE_AA
     )
 
-    return steering, acceleration, drive_mode, debug_frame
+    is_edge_escape = target_choice.get('is_edge_escape', False) if target_choice is not None else False
+
+    return steering, acceleration, drive_mode, debug_frame, is_edge_escape
 
 
 def processing_task():
     global is_running
     global last_status_print
+    
+    if not hasattr(processing_task, "last_escape_print"):
+        processing_task.last_escape_print = 0.0
 
     if quit_requested():
         is_running = False
@@ -982,7 +1126,13 @@ def processing_task():
         front_frame = shared_data['latest_front_frame']
 
     if front_frame is not None:
-        steering, acceleration, drive_mode, debug_frame = analyse_drive(front_frame)
+
+        steering, acceleration, drive_mode, debug_frame, is_edge_escape = analyse_drive(front_frame)
+
+        current_time = time.time()
+        if is_edge_escape and (current_time - processing_task.last_escape_print > 1.0):
+            print("\n[ALERT] !!! EMERGENCY EDGE ESCAPE TRIGGERED !!!\n")
+            processing_task.last_escape_print = current_time
 
         with data_lock:
             previous_acceleration = shared_data['acceleration_input']
@@ -1121,4 +1271,5 @@ if __name__ == '__main__':
     if control_conn:
         control_conn.close()
     cv2.destroyAllWindows()
-    print("System terminated cleanly.")
+    print("System terminated cleanly.") 
+  
