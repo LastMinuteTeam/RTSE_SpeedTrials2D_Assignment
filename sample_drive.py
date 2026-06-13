@@ -26,7 +26,8 @@ shared_data = {
     'sent_steering_input': 0.0,
     'sent_acceleration_input': 1.0,
     'drive_mode': 'search',
-    'debug_frame': None
+    'debug_frame': None,
+    'back_debug_frame': None
 }
 data_lock = threading.Lock()
 is_running = True
@@ -44,9 +45,38 @@ FAR_TOKEN_MIN_AREA = 30
 HAZARD_MIN_Y = 0.14
 CENTER_LINE_TOLERANCE = 0.04
 CENTER_LINE_SOFTNESS = 0.06
+CHASE_BACK_CENTER_TOLERANCE = 0.10
+CHASE_BACK_HOLD_TIME = 0.50
+CHASE_BACK_MIN_AREA = 28
+CHASE_BACK_FAR_MIN_AREA = 8
+CHASE_BACK_NEAR_MIN_AREA = 55
+CHASE_BACK_NEAR_MIN_Y = 0.46
+CHASE_BACK_ROI_TOP = 0.42
+CHASE_BACK_ROI_BOTTOM = 0.94
+CHASE_BACK_BLUE_MIN = 70
+CHASE_BACK_BLUE_MAX = 230
+CHASE_BACK_GREEN_MIN = 85
+CHASE_BACK_GREEN_MAX = 235
+CHASE_BACK_RED_MIN = 0
+CHASE_BACK_RED_MAX = 120
+CHASE_BACK_HUE_MIN = 75
+CHASE_BACK_HUE_MAX = 102
+CHASE_BACK_SAT_MIN = 60
+CHASE_BACK_VAL_MIN = 45
+CHASE_BACK_MAX_BG_DIFF = 75
 STEERING_TAP_COOLDOWN = 0.03
 GREEN_STEERING_TAP_COOLDOWN = 0.02
 STEERING_CONFIRM_CYCLES = 1
+LOW_LIGHT_BASELINE_EMA = 0.015
+LOW_LIGHT_RATIO_EMA = 0.020
+LOW_LIGHT_ENTRY_BRIGHTNESS_RATIO = 0.58
+LOW_LIGHT_ENTRY_BRIGHT_PIXEL_RATIO = 0.42
+LOW_LIGHT_EXIT_BRIGHTNESS_RATIO = 0.78
+LOW_LIGHT_EXIT_BRIGHT_PIXEL_RATIO = 0.68
+LOW_LIGHT_ABSOLUTE_BRIGHTNESS = 58.0
+LOW_LIGHT_BRIGHT_PIXEL_THRESHOLD = 90
+LOW_LIGHT_MAX_HALF_BRIGHTNESS_GAP = 24.0
+LOW_LIGHT_MAX_HALF_RATIO_GAP = 0.22
 EDGE_MARGIN_RATIO = 0.25
 MIN_TOKEN_ASPECT = 0.55
 MAX_TOKEN_ASPECT = 1.80
@@ -264,6 +294,11 @@ def read_single_camera(sock, window_name, data_key):
                         debug_frame = shared_data['debug_frame']
                     if debug_frame is not None and debug_frame.shape == frame.shape:
                         frame_to_show = debug_frame
+                elif data_key == 'latest_back_frame':
+                    with data_lock:
+                        back_debug_frame = shared_data['back_debug_frame']
+                    if back_debug_frame is not None and back_debug_frame.shape == frame.shape:
+                        frame_to_show = back_debug_frame
 
                 frame_resized = cv2.resize(frame_to_show, (640, 480))
                 cv2.imshow(window_name, frame_resized)
@@ -318,6 +353,210 @@ def center_line_overlap(token_x, center_x_norm):
 
     fade_width = max(CENTER_LINE_SOFTNESS, 1e-3)
     return clamp(1.0 - ((distance - CENTER_LINE_TOLERANCE) / fade_width), 0.0, 1.0)
+
+
+def detect_low_light(frame):
+    if not hasattr(detect_low_light, "baseline_brightness"):
+        detect_low_light.baseline_brightness = None
+        detect_low_light.baseline_bright_ratio = None
+        detect_low_light.is_active = False
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    roi_top = int(frame.shape[0] * 0.08)
+    roi_bottom = int(frame.shape[0] * 0.80)
+    gray_roi = gray[roi_top:roi_bottom, :]
+    half_width = gray_roi.shape[1] // 2
+    left_half = gray_roi[:, :half_width]
+    right_half = gray_roi[:, half_width:]
+
+    brightness_mean = float(np.mean(gray_roi))
+    bright_pixel_ratio = float(np.mean(gray_roi >= LOW_LIGHT_BRIGHT_PIXEL_THRESHOLD))
+    left_brightness = float(np.mean(left_half))
+    right_brightness = float(np.mean(right_half))
+    left_bright_ratio = float(np.mean(left_half >= LOW_LIGHT_BRIGHT_PIXEL_THRESHOLD))
+    right_bright_ratio = float(np.mean(right_half >= LOW_LIGHT_BRIGHT_PIXEL_THRESHOLD))
+    half_brightness_gap = abs(left_brightness - right_brightness)
+    half_ratio_gap = abs(left_bright_ratio - right_bright_ratio)
+    whole_scene_dark = (
+        half_brightness_gap <= LOW_LIGHT_MAX_HALF_BRIGHTNESS_GAP and
+        half_ratio_gap <= LOW_LIGHT_MAX_HALF_RATIO_GAP
+    )
+
+    if detect_low_light.baseline_brightness is None:
+        detect_low_light.baseline_brightness = brightness_mean
+        detect_low_light.baseline_bright_ratio = bright_pixel_ratio
+        return False, brightness_mean, bright_pixel_ratio
+
+    baseline_brightness = detect_low_light.baseline_brightness
+    baseline_bright_ratio = detect_low_light.baseline_bright_ratio
+
+    brightness_ratio = brightness_mean / max(baseline_brightness, 1.0)
+    bright_ratio_ratio = bright_pixel_ratio / max(baseline_bright_ratio, 1e-4)
+
+    low_light_now = (
+        whole_scene_dark and (
+            brightness_mean <= LOW_LIGHT_ABSOLUTE_BRIGHTNESS or
+            (
+                brightness_ratio <= LOW_LIGHT_ENTRY_BRIGHTNESS_RATIO and
+                bright_ratio_ratio <= LOW_LIGHT_ENTRY_BRIGHT_PIXEL_RATIO
+            )
+        )
+    )
+
+    if detect_low_light.is_active:
+        recovered = (
+            not whole_scene_dark or
+            brightness_ratio >= LOW_LIGHT_EXIT_BRIGHTNESS_RATIO or
+            bright_ratio_ratio >= LOW_LIGHT_EXIT_BRIGHT_PIXEL_RATIO
+        )
+        detect_low_light.is_active = not recovered
+    else:
+        detect_low_light.is_active = low_light_now
+
+    if not detect_low_light.is_active:
+        detect_low_light.baseline_brightness = (
+            (1.0 - LOW_LIGHT_BASELINE_EMA) * baseline_brightness +
+            (LOW_LIGHT_BASELINE_EMA * brightness_mean)
+        )
+        detect_low_light.baseline_bright_ratio = (
+            (1.0 - LOW_LIGHT_RATIO_EMA) * baseline_bright_ratio +
+            (LOW_LIGHT_RATIO_EMA * bright_pixel_ratio)
+        )
+
+    return detect_low_light.is_active, brightness_mean, bright_pixel_ratio
+
+
+def chasing_min_area_for_y(norm_y):
+    near_weight = clamp((norm_y - 0.20) / 0.70, 0.0, 1.0)
+    return CHASE_BACK_FAR_MIN_AREA + ((CHASE_BACK_MIN_AREA - CHASE_BACK_FAR_MIN_AREA) * near_weight)
+
+
+def detect_chasing_car(back_frame):
+    if not hasattr(detect_chasing_car, "last_result"):
+        detect_chasing_car.last_result = None
+        detect_chasing_car.last_seen_time = 0.0
+
+    if back_frame is None:
+        return None
+
+    height, width = back_frame.shape[:2]
+    roi_top = int(height * CHASE_BACK_ROI_TOP)
+    roi_bottom = int(height * CHASE_BACK_ROI_BOTTOM)
+    roi = back_frame[roi_top:roi_bottom, :]
+    if roi.size == 0:
+        return None
+
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    blue_channel = roi[:, :, 0]
+    green_channel = roi[:, :, 1]
+    red_channel = roi[:, :, 2]
+
+    bgr_mask = (
+        (blue_channel >= CHASE_BACK_BLUE_MIN) & (blue_channel <= CHASE_BACK_BLUE_MAX) &
+        (green_channel >= CHASE_BACK_GREEN_MIN) & (green_channel <= CHASE_BACK_GREEN_MAX) &
+        (red_channel >= CHASE_BACK_RED_MIN) & (red_channel <= CHASE_BACK_RED_MAX) &
+        (np.abs(green_channel.astype(np.int16) - blue_channel.astype(np.int16)) <= CHASE_BACK_MAX_BG_DIFF)
+    ).astype(np.uint8) * 255
+    hsv_mask = cv2.inRange(
+        hsv,
+        np.array([CHASE_BACK_HUE_MIN, CHASE_BACK_SAT_MIN, CHASE_BACK_VAL_MIN]),
+        np.array([CHASE_BACK_HUE_MAX, 255, 255])
+    )
+    mask = cv2.bitwise_and(bgr_mask, hsv_mask)
+    mask = clean_color_mask(mask)
+    mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=1)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best_detection = None
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        x, y, w, h = cv2.boundingRect(contour)
+        center_y = y + (h / 2.0)
+        norm_y = center_y / max(float(roi.shape[0]), 1.0)
+        if area < chasing_min_area_for_y(norm_y):
+            continue
+
+        aspect_ratio = w / max(float(h), 1.0)
+        if aspect_ratio < 0.55 or aspect_ratio > 3.20:
+            continue
+        fill_ratio = area / max(float(w * h), 1.0)
+        if fill_ratio < 0.12:
+            continue
+
+        center_x = x + (w / 2.0)
+        norm_x = normalize_x(center_x, roi.shape[1])
+        score = (area * 1.2) + (fill_ratio * 30.0) - (abs(norm_x) * 60.0) - ((1.0 - norm_y) * 8.0)
+        detection = {
+            'rect': (x, y + roi_top, w, h),
+            'norm_x': norm_x,
+            'norm_y': norm_y,
+            'area': area,
+            'near': area >= CHASE_BACK_NEAR_MIN_AREA or norm_y >= CHASE_BACK_NEAR_MIN_Y,
+            'same_lane': abs(norm_x) <= CHASE_BACK_CENTER_TOLERANCE,
+            'score': score
+        }
+        if best_detection is None or detection['score'] > best_detection['score']:
+            best_detection = detection
+
+    current_time = time.time()
+    if best_detection is not None:
+        detect_chasing_car.last_result = dict(best_detection)
+        detect_chasing_car.last_seen_time = current_time
+        return best_detection
+
+    if (
+        detect_chasing_car.last_result is not None and
+        (current_time - detect_chasing_car.last_seen_time) <= CHASE_BACK_HOLD_TIME
+    ):
+        return dict(detect_chasing_car.last_result)
+
+    detect_chasing_car.last_result = None
+    return None
+
+
+def build_back_debug_frame(back_frame, chasing_car):
+    if back_frame is None:
+        return None
+
+    debug_back = back_frame.copy()
+    height, width = debug_back.shape[:2]
+    roi_top = int(height * CHASE_BACK_ROI_TOP)
+    roi_bottom = int(height * CHASE_BACK_ROI_BOTTOM)
+    center_x = width // 2
+    band_half_width = int(width * CHASE_BACK_CENTER_TOLERANCE * 0.5)
+    band_left = max(0, center_x - band_half_width)
+    band_right = min(width - 1, center_x + band_half_width)
+
+    cv2.rectangle(debug_back, (0, roi_top), (width - 1, roi_bottom), (80, 80, 80), 2)
+    cv2.line(debug_back, (center_x, roi_top), (center_x, roi_bottom), (255, 0, 0), 2)
+    cv2.rectangle(debug_back, (band_left, roi_top), (band_right, roi_bottom), (255, 255, 0), 2)
+
+    if chasing_car is not None:
+        x, y, w, h = chasing_car['rect']
+        color = (0, 165, 255) if chasing_car['same_lane'] else (160, 160, 160)
+        cv2.rectangle(debug_back, (x, y), (x + w, y + h), color, 2)
+        cv2.putText(
+            debug_back,
+            f"ghost {'same lane' if chasing_car['same_lane'] else 'other lane'}",
+            (x, max(18, y - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            color,
+            2,
+            cv2.LINE_AA
+        )
+
+    cv2.putText(
+        debug_back,
+        "Blue=center  Yellow band=same-lane zone",
+        (10, height - 12),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA
+    )
+    return debug_back
 
 
 def clean_color_mask(mask):
@@ -537,11 +776,15 @@ def choose_green_target(tokens, path_center):
     }
 
 
-def choose_hazard_avoidance(tokens, path_center):
+def choose_hazard_avoidance(tokens, path_center, avoid_red=True):
     blocking_hazards = []
     strongest_threat = 0.0
 
-    for token_type in ('red', 'yellow', 'gray'):
+    hazard_types = ['yellow', 'gray']
+    if avoid_red:
+        hazard_types.insert(0, 'red')
+
+    for token_type in hazard_types:
         for token in tokens[token_type]:
             if token['norm_y'] < HAZARD_MIN_Y:
                 continue
@@ -801,8 +1044,21 @@ def apply_boundary_fallback(target_choice, road_mask, frame_width):
     return replacement
 
 
-def analyse_drive(front_frame):
+def analyse_drive(front_frame, back_frame=None):
+    if not hasattr(analyse_drive, "chase_override_active"):
+        analyse_drive.chase_override_active = False
+
     height, width = front_frame.shape[:2]
+    low_light_active, scene_brightness, bright_pixel_ratio = detect_low_light(front_frame)
+    chasing_car = detect_chasing_car(back_frame)
+    if chasing_car is not None and chasing_car.get('near', False):
+        analyse_drive.chase_override_active = True
+    elif chasing_car is None:
+        analyse_drive.chase_override_active = False
+
+    chase_visible = chasing_car is not None
+    chasing_same_lane = chase_visible and chasing_car['same_lane']
+    chase_override_active = analyse_drive.chase_override_active and chase_visible
     roi_top = int(height * ROI_START)
     roi = front_frame[roi_top:, :]
     roi_height, roi_width = roi.shape[:2]
@@ -825,14 +1081,28 @@ def analyse_drive(front_frame):
     with data_lock:
         sent_steering = shared_data['sent_steering_input']
         sent_acceleration = shared_data['sent_acceleration_input']
-    tokens = find_tokens(front_frame, road_mask, roi_top, lane_left_norm, lane_right_norm)
-    green_choice = choose_green_target(tokens, path_center)
-    hazard_choice = choose_hazard_avoidance(tokens, path_center)
+    if low_light_active:
+        tokens = {'green': [], 'yellow': [], 'red': [], 'gray': []}
+        green_choice = None
+        hazard_choice = None
+    else:
+        tokens = find_tokens(front_frame, road_mask, roi_top, lane_left_norm, lane_right_norm)
+        green_choice = choose_green_target(tokens, path_center)
+        hazard_choice = choose_hazard_avoidance(tokens, path_center)
 
     green_front_priority = green_choice.get('front_priority_score', -1.0) if green_choice is not None else -1.0
     hazard_front_priority = hazard_choice.get('front_priority_score', -1.0) if hazard_choice is not None else -1.0
 
-    if (
+    if chase_visible:
+        mirrored_chase_x = -chasing_car['norm_x']
+        chase_direction = -1.0 if mirrored_chase_x >= 0.0 else 1.0
+        raw_path_choice = {
+            'mode': 'chase_avoid',
+            'target_x': (0.72 if chase_override_active else 0.52) * chase_direction,
+            'target_y': 0.76,
+            'strength': 1.0 if chase_override_active else 0.82
+        }
+    elif (
         hazard_choice is not None and
         hazard_choice['strength'] >= HAZARD_OVERRIDE_THREAT and
         hazard_front_priority >= (green_front_priority + GREEN_FRONT_PRIORITY_ADVANTAGE)
@@ -845,11 +1115,17 @@ def analyse_drive(front_frame):
     else:
         raw_path_choice = None
 
-    target_choice = get_stable_path(raw_path_choice, green_choice is not None, hazard_choice is not None)
-    target_choice = apply_boundary_fallback(target_choice, road_mask, width)
+    if chase_visible:
+        target_choice = raw_path_choice
+    else:
+        target_choice = get_stable_path(raw_path_choice, green_choice is not None, hazard_choice is not None)
+        target_choice = apply_boundary_fallback(target_choice, road_mask, width)
     focused_hazards = hazard_choice['focused_hazards'] if hazard_choice is not None else []
     focused_greens = green_choice['focused_tokens'] if green_choice is not None else []
-    path_lock_state = getattr(get_stable_path, "state_label", "released")
+    path_lock_state = (
+        "chase-override" if chase_override_active else
+        ("chase-track" if chase_visible else getattr(get_stable_path, "state_label", "released"))
+    )
 
     drive_mode = 'path'
     steering = 0.0
@@ -864,10 +1140,14 @@ def analyse_drive(front_frame):
         drive_mode = target_choice['mode']
 
     acceleration = TEST_THROTTLE
-    if drive_mode == "avoid":
+    if low_light_active:
+        acceleration = -1.0
+        drive_mode = 'low_light'
+    elif drive_mode in ("avoid", "chase_avoid"):
         acceleration = min(acceleration, 0.72)
 
     debug_frame = front_frame.copy()
+    back_debug_frame = build_back_debug_frame(back_frame, chasing_car)
     cv2.rectangle(debug_frame, (0, roi_top), (width - 1, height - 1), (80, 80, 80), 2)
     cv2.line(debug_frame, (center_x, roi_top), (center_x, height - 1), (255, 0, 0), 2)
     road_overlay = cv2.cvtColor(road_mask, cv2.COLOR_GRAY2BGR)
@@ -956,6 +1236,50 @@ def analyse_drive(front_frame):
         cv2.LINE_AA
     )
 
+    if low_light_active:
+        cv2.putText(
+            debug_frame,
+            f"LOW LIGHT RECOVERY brightness={scene_brightness:.1f} bright_ratio={bright_pixel_ratio:.2f}",
+            (10, 76),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (0, 200, 255),
+            2,
+            cv2.LINE_AA
+        )
+
+    if chasing_car is not None:
+        x, y, w, h = chasing_car['rect']
+        chase_color = (0, 165, 255) if chase_override_active else ((0, 220, 220) if chasing_same_lane else (160, 160, 160))
+        box_w = max(24, int(width * 0.10))
+        box_h = max(16, int(height * 0.06))
+        mirrored_norm_x = -chasing_car['norm_x']
+        front_box_x = int(clamp(((mirrored_norm_x + 1.0) * 0.5 * width) - (box_w * 0.5), 0, width - box_w - 1))
+        front_box_y = 112
+        cv2.putText(
+            debug_frame,
+            f"CHASE BACK {'OVERRIDE' if chase_override_active else ('BLOCKING' if chasing_same_lane else 'seen')} x={chasing_car['norm_x']:+.2f}",
+            (10, 100),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            chase_color,
+            2,
+            cv2.LINE_AA
+        )
+        rear_center_x = int(((mirrored_norm_x + 1.0) * 0.5) * width)
+        cv2.line(debug_frame, (rear_center_x, 0), (rear_center_x, 40), chase_color, 2)
+        cv2.rectangle(debug_frame, (front_box_x, front_box_y), (front_box_x + box_w, front_box_y + box_h), chase_color, 2)
+        cv2.putText(
+            debug_frame,
+            "ghost rear",
+            (front_box_x, min(height - 10, front_box_y + box_h + 18)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            chase_color,
+            2,
+            cv2.LINE_AA
+        )
+
     cv2.putText(
         debug_frame,
         "Blue=center  Green path=target  Green/Yellow/Red/Gray=detected objects",
@@ -967,7 +1291,7 @@ def analyse_drive(front_frame):
         cv2.LINE_AA
     )
 
-    return steering, acceleration, drive_mode, debug_frame
+    return steering, acceleration, drive_mode, debug_frame, back_debug_frame
 
 
 def processing_task():
@@ -980,9 +1304,10 @@ def processing_task():
 
     with data_lock:
         front_frame = shared_data['latest_front_frame']
+        back_frame = shared_data['latest_back_frame']
 
     if front_frame is not None:
-        steering, acceleration, drive_mode, debug_frame = analyse_drive(front_frame)
+        steering, acceleration, drive_mode, debug_frame, back_debug_frame = analyse_drive(front_frame, back_frame)
 
         with data_lock:
             previous_acceleration = shared_data['acceleration_input']
@@ -992,6 +1317,7 @@ def processing_task():
             shared_data['acceleration_input'] = previous_acceleration * (1.0 - accel_blend) + acceleration * accel_blend
             shared_data['drive_mode'] = drive_mode
             shared_data['debug_frame'] = debug_frame
+            shared_data['back_debug_frame'] = back_debug_frame
 
         current_time = time.time()
         if current_time - last_status_print >= 1.0:
@@ -1008,6 +1334,7 @@ def processing_task():
             shared_data['steering_input'] = 0.0
             shared_data['acceleration_input'] = TEST_THROTTLE
             shared_data['drive_mode'] = 'search'
+            shared_data['back_debug_frame'] = None
 
 
 def send_controls_task():
