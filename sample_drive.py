@@ -64,6 +64,35 @@ CHASE_BACK_HUE_MAX = 102
 CHASE_BACK_SAT_MIN = 60
 CHASE_BACK_VAL_MIN = 45
 CHASE_BACK_MAX_BG_DIFF = 75
+POLICE_HOLD_TIME = 0.40
+POLICE_ROI_TOP = ROI_START
+POLICE_ROI_BOTTOM = 0.82
+POLICE_ROI_LEFT = 0.18
+POLICE_ROI_RIGHT = 0.82
+POLICE_CENTER_TOLERANCE = 0.34
+POLICE_FAR_MIN_AREA = 14
+POLICE_MIN_AREA = 42
+POLICE_NEAR_MIN_AREA = 70
+POLICE_NEAR_MIN_Y = 0.40
+POLICE_MIN_BOX_WIDTH = 14
+POLICE_MIN_BOX_HEIGHT = 10
+POLICE_MAX_BOX_ASPECT = 3.20
+POLICE_MIN_NORM_Y = 0.10
+POLICE_RED_BGR_MIN = np.array([0, 0, 85], dtype=np.uint8)
+POLICE_RED_BGR_MAX = np.array([110, 125, 185], dtype=np.uint8)
+POLICE_BLUE_BGR_MIN = np.array([55, 0, 18], dtype=np.uint8)
+POLICE_BLUE_BGR_MAX = np.array([150, 105, 115], dtype=np.uint8)
+POLICE_RED_HSV_1_MIN = np.array([0, 70, 45], dtype=np.uint8)
+POLICE_RED_HSV_1_MAX = np.array([12, 255, 255], dtype=np.uint8)
+POLICE_RED_HSV_2_MIN = np.array([168, 70, 45], dtype=np.uint8)
+POLICE_RED_HSV_2_MAX = np.array([180, 255, 255], dtype=np.uint8)
+POLICE_BLUE_HSV_MIN = np.array([112, 55, 25], dtype=np.uint8)
+POLICE_BLUE_HSV_MAX = np.array([145, 255, 170], dtype=np.uint8)
+POLICE_MIN_COLOR_PIXELS = 12
+POLICE_MIN_COLOR_SHARE = 0.07
+POLICE_MIN_HALF_COLOR_PIXELS = 8
+POLICE_MIN_HALF_COLOR_SHARE = 0.10
+POLICE_MIN_PAIR_FILL_RATIO = 0.16
 STEERING_TAP_COOLDOWN = 0.03
 GREEN_STEERING_TAP_COOLDOWN = 0.02
 STEERING_CONFIRM_CYCLES = 1
@@ -431,6 +460,11 @@ def chasing_min_area_for_y(norm_y):
     return CHASE_BACK_FAR_MIN_AREA + ((CHASE_BACK_MIN_AREA - CHASE_BACK_FAR_MIN_AREA) * near_weight)
 
 
+def police_min_area_for_y(norm_y):
+    near_weight = clamp((norm_y - 0.14) / 0.68, 0.0, 1.0)
+    return POLICE_FAR_MIN_AREA + ((POLICE_MIN_AREA - POLICE_FAR_MIN_AREA) * near_weight)
+
+
 def detect_chasing_car(back_frame):
     if not hasattr(detect_chasing_car, "last_result"):
         detect_chasing_car.last_result = None
@@ -511,6 +545,160 @@ def detect_chasing_car(back_frame):
         return dict(detect_chasing_car.last_result)
 
     detect_chasing_car.last_result = None
+    return None
+
+
+def detect_police_car(front_frame):
+    if not hasattr(detect_police_car, "last_result"):
+        detect_police_car.last_result = None
+        detect_police_car.last_seen_time = 0.0
+        detect_police_car.debug = None
+
+    if front_frame is None:
+        detect_police_car.debug = None
+        return None
+
+    height, width = front_frame.shape[:2]
+    roi_top = int(height * POLICE_ROI_TOP)
+    roi_bottom = int(height * POLICE_ROI_BOTTOM)
+    roi_left = int(width * POLICE_ROI_LEFT)
+    roi_right = int(width * POLICE_ROI_RIGHT)
+    roi = front_frame[roi_top:roi_bottom, roi_left:roi_right]
+    if roi.size == 0:
+        detect_police_car.debug = None
+        return None
+
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    red_bgr_mask = cv2.inRange(roi, POLICE_RED_BGR_MIN, POLICE_RED_BGR_MAX)
+    red_hsv_mask = cv2.bitwise_or(
+        cv2.inRange(hsv, POLICE_RED_HSV_1_MIN, POLICE_RED_HSV_1_MAX),
+        cv2.inRange(hsv, POLICE_RED_HSV_2_MIN, POLICE_RED_HSV_2_MAX)
+    )
+    blue_bgr_mask = cv2.inRange(roi, POLICE_BLUE_BGR_MIN, POLICE_BLUE_BGR_MAX)
+    blue_hsv_mask = cv2.inRange(hsv, POLICE_BLUE_HSV_MIN, POLICE_BLUE_HSV_MAX)
+
+    red_mask = clean_color_mask(cv2.bitwise_and(red_bgr_mask, red_hsv_mask))
+    blue_mask = clean_color_mask(cv2.bitwise_and(blue_bgr_mask, blue_hsv_mask))
+    red_mask = cv2.dilate(red_mask, np.ones((3, 3), np.uint8), iterations=1)
+    blue_mask = cv2.dilate(blue_mask, np.ones((3, 3), np.uint8), iterations=1)
+
+    combined_mask = cv2.bitwise_or(red_mask, blue_mask)
+    combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    red_candidate_boxes = []
+    blue_candidate_boxes = []
+    best_detection = None
+    current_time = time.time()
+
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        x, y, w, h = cv2.boundingRect(contour)
+        center_x = x + (w / 2.0)
+        center_y = y + (h / 2.0)
+        norm_x = normalize_x(center_x, roi.shape[1])
+        norm_y = center_y / max(float(roi.shape[0]), 1.0)
+
+        if area < police_min_area_for_y(norm_y):
+            continue
+        if w < POLICE_MIN_BOX_WIDTH or h < POLICE_MIN_BOX_HEIGHT:
+            continue
+        if (w / max(float(h), 1.0)) > POLICE_MAX_BOX_ASPECT:
+            continue
+        if abs(norm_x) > POLICE_CENTER_TOLERANCE:
+            continue
+        if norm_y < POLICE_MIN_NORM_Y:
+            continue
+
+        box_area = max(float(w * h), 1.0)
+        red_patch = red_mask[y:y + h, x:x + w]
+        blue_patch = blue_mask[y:y + h, x:x + w]
+        red_pixels = cv2.countNonZero(red_patch)
+        blue_pixels = cv2.countNonZero(blue_patch)
+        if red_pixels < POLICE_MIN_COLOR_PIXELS or blue_pixels < POLICE_MIN_COLOR_PIXELS:
+            continue
+        if (red_pixels / box_area) < POLICE_MIN_COLOR_SHARE:
+            continue
+        if (blue_pixels / box_area) < POLICE_MIN_COLOR_SHARE:
+            continue
+
+        mid_x = w // 2
+        left_red = cv2.countNonZero(red_patch[:, :mid_x])
+        left_blue = cv2.countNonZero(blue_patch[:, :mid_x])
+        right_red = cv2.countNonZero(red_patch[:, mid_x:])
+        right_blue = cv2.countNonZero(blue_patch[:, mid_x:])
+        half_area = max(float(max(mid_x, 1) * h), 1.0)
+
+        left_red_right_blue = (
+            left_red >= POLICE_MIN_HALF_COLOR_PIXELS and
+            right_blue >= POLICE_MIN_HALF_COLOR_PIXELS and
+            (left_red / half_area) >= POLICE_MIN_HALF_COLOR_SHARE and
+            (right_blue / half_area) >= POLICE_MIN_HALF_COLOR_SHARE and
+            left_red > left_blue and
+            right_blue > right_red
+        )
+        left_blue_right_red = (
+            left_blue >= POLICE_MIN_HALF_COLOR_PIXELS and
+            right_red >= POLICE_MIN_HALF_COLOR_PIXELS and
+            (left_blue / half_area) >= POLICE_MIN_HALF_COLOR_SHARE and
+            (right_red / half_area) >= POLICE_MIN_HALF_COLOR_SHARE and
+            left_blue > left_red and
+            right_red > right_blue
+        )
+        if not (left_red_right_blue or left_blue_right_red):
+            continue
+
+        pair_fill_ratio = (red_pixels + blue_pixels) / box_area
+        if pair_fill_ratio < POLICE_MIN_PAIR_FILL_RATIO:
+            continue
+
+        red_contours, _ = cv2.findContours(red_patch, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for sub_contour in red_contours:
+            sub_area = cv2.contourArea(sub_contour)
+            if sub_area < 6:
+                continue
+            sx, sy, sw, sh = cv2.boundingRect(sub_contour)
+            red_candidate_boxes.append((x + sx + roi_left, y + sy + roi_top, sw, sh))
+
+        blue_contours, _ = cv2.findContours(blue_patch, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for sub_contour in blue_contours:
+            sub_area = cv2.contourArea(sub_contour)
+            if sub_area < 6:
+                continue
+            sx, sy, sw, sh = cv2.boundingRect(sub_contour)
+            blue_candidate_boxes.append((x + sx + roi_left, y + sy + roi_top, sw, sh))
+
+        detection = {
+            'rect': (x + roi_left, y + roi_top, w, h),
+            'norm_x': normalize_x(center_x + roi_left, width),
+            'norm_y': (center_y + roi_top) / max(float(height), 1.0),
+            'norm_w': (2.0 * w) / max(float(width), 1.0),
+            'area': float(red_pixels + blue_pixels),
+            'near': area >= POLICE_NEAR_MIN_AREA or norm_y >= POLICE_NEAR_MIN_Y,
+            'score': (area * 1.10) + (pair_fill_ratio * 24.0) + (norm_y * 16.0) - (abs(norm_x) * 28.0)
+        }
+        if best_detection is None or detection['score'] > best_detection['score']:
+            best_detection = detection
+
+    detect_police_car.debug = {
+        'roi_rect': (roi_left, roi_top, roi_right - roi_left, roi_bottom - roi_top),
+        'red_boxes': red_candidate_boxes,
+        'blue_boxes': blue_candidate_boxes,
+        'final_rect': None if best_detection is None else best_detection['rect']
+    }
+
+    if best_detection is not None:
+        detect_police_car.last_result = dict(best_detection)
+        detect_police_car.last_seen_time = current_time
+        return best_detection
+
+    if (
+        detect_police_car.last_result is not None and
+        (current_time - detect_police_car.last_seen_time) <= POLICE_HOLD_TIME
+    ):
+        return dict(detect_police_car.last_result)
+
+    detect_police_car.last_result = None
     return None
 
 
@@ -773,6 +961,92 @@ def choose_green_target(tokens, path_center):
         'token': best_target,
         'front_priority_score': best_entry['priority_score'],
         'focused_tokens': [entry['token'] for entry in focused_targets]
+    }
+
+
+def choose_red_target(tokens, path_center):
+    candidate_targets = []
+    best_priority_score = None
+
+    for token in tokens['red']:
+        if token['norm_y'] < HAZARD_MIN_Y:
+            continue
+
+        closeness = clamp((token['norm_y'] - HAZARD_MIN_Y) / (1.0 - HAZARD_MIN_Y), 0.0, 1.0)
+        center_score = center_line_overlap(token['norm_x'], path_center)
+        wide_alignment = 1.0 - clamp(abs(token['norm_x'] - path_center) / GREEN_MAX_OFFSET, 0.0, 1.0)
+        score = (closeness * 1.55) + (center_score * 1.10) + (wide_alignment * 0.35)
+        priority_score = token['norm_y'] + (token.get('norm_w', 0.0) * HAZARD_SIZE_PRIORITY_WEIGHT)
+
+        candidate_targets.append({
+            'token': token,
+            'score': score,
+            'priority_score': priority_score
+        })
+        if best_priority_score is None or priority_score > best_priority_score:
+            best_priority_score = priority_score
+
+    if not candidate_targets or best_priority_score is None:
+        return None
+
+    focused_targets = [
+        entry for entry in candidate_targets
+        if entry['priority_score'] >= (best_priority_score - HAZARD_FRONT_PRIORITY_WINDOW)
+    ]
+    if not focused_targets:
+        return None
+
+    best_entry = max(focused_targets, key=lambda entry: entry['score'])
+    best_target = best_entry['token']
+    if best_entry['score'] < 0.10:
+        return None
+
+    return {
+        'mode': 'police_red',
+        'target_x': best_target['norm_x'],
+        'target_y': best_target['norm_y'],
+        'strength': best_entry['score'],
+        'token': best_target,
+        'front_priority_score': best_entry['priority_score'],
+        'focused_tokens': [entry['token'] for entry in focused_targets]
+    }
+
+
+def choose_police_car_avoidance(police_car, path_center):
+    if police_car is None:
+        return None
+
+    path_overlap = center_line_overlap(police_car['norm_x'], path_center)
+    if path_overlap <= 0.0:
+        return None
+
+    closeness = clamp((police_car['norm_y'] - HAZARD_MIN_Y) / (1.0 - HAZARD_MIN_Y), 0.0, 1.0)
+    threat = (closeness * 1.45) * path_overlap * 1.45
+    interval_half = max((police_car.get('norm_w', 0.14) * 0.60) + HAZARD_CLEARANCE, 0.10)
+    left_bound = clamp(police_car['norm_x'] - interval_half, ROAD_LEFT_LIMIT, ROAD_RIGHT_LIMIT)
+    right_bound = clamp(police_car['norm_x'] + interval_half, ROAD_LEFT_LIMIT, ROAD_RIGHT_LIMIT)
+
+    left_gap = left_bound - ROAD_LEFT_LIMIT
+    right_gap = ROAD_RIGHT_LIMIT - right_bound
+    target_x = ROAD_LEFT_LIMIT if left_gap >= right_gap else ROAD_RIGHT_LIMIT
+
+    return {
+        'mode': 'police_avoid',
+        'target_x': target_x,
+        'target_y': max(0.68, police_car['norm_y']),
+        'strength': threat,
+        'front_priority_score': police_car['norm_y'] + (police_car.get('norm_w', 0.0) * HAZARD_SIZE_PRIORITY_WEIGHT),
+        'focused_hazards': [{
+            'type': 'police',
+            'token': {
+                'rect': police_car['rect']
+            },
+            'threat': threat,
+            'left': left_bound,
+            'right': right_bound,
+            'priority_score': police_car['norm_y']
+        }],
+        'gap_centers': [target_x]
     }
 
 
@@ -1051,6 +1325,8 @@ def analyse_drive(front_frame, back_frame=None):
     height, width = front_frame.shape[:2]
     low_light_active, scene_brightness, bright_pixel_ratio = detect_low_light(front_frame)
     chasing_car = detect_chasing_car(back_frame)
+    police_car = None if low_light_active else detect_police_car(front_frame)
+    police_active = police_car is not None
     if chasing_car is not None and chasing_car.get('near', False):
         analyse_drive.chase_override_active = True
     elif chasing_car is None:
@@ -1084,14 +1360,20 @@ def analyse_drive(front_frame, back_frame=None):
     if low_light_active:
         tokens = {'green': [], 'yellow': [], 'red': [], 'gray': []}
         green_choice = None
+        red_choice = None
         hazard_choice = None
+        police_avoid_choice = None
     else:
         tokens = find_tokens(front_frame, road_mask, roi_top, lane_left_norm, lane_right_norm)
         green_choice = choose_green_target(tokens, path_center)
-        hazard_choice = choose_hazard_avoidance(tokens, path_center)
+        red_choice = choose_red_target(tokens, path_center) if police_active else None
+        hazard_choice = choose_hazard_avoidance(tokens, path_center, avoid_red=not police_active)
+        police_avoid_choice = choose_police_car_avoidance(police_car, path_center) if police_active else None
 
     green_front_priority = green_choice.get('front_priority_score', -1.0) if green_choice is not None else -1.0
+    red_front_priority = red_choice.get('front_priority_score', -1.0) if red_choice is not None else -1.0
     hazard_front_priority = hazard_choice.get('front_priority_score', -1.0) if hazard_choice is not None else -1.0
+    police_front_priority = police_avoid_choice.get('front_priority_score', -1.0) if police_avoid_choice is not None else -1.0
 
     if chase_visible:
         mirrored_chase_x = -chasing_car['norm_x']
@@ -1102,6 +1384,10 @@ def analyse_drive(front_frame, back_frame=None):
             'target_y': 0.76,
             'strength': 1.0 if chase_override_active else 0.82
         }
+    elif police_avoid_choice is not None and police_front_priority >= red_front_priority:
+        raw_path_choice = police_avoid_choice
+    elif police_active and red_choice is not None and red_front_priority >= green_front_priority:
+        raw_path_choice = red_choice
     elif (
         hazard_choice is not None and
         hazard_choice['strength'] >= HAZARD_OVERRIDE_THREAT and
@@ -1118,10 +1404,14 @@ def analyse_drive(front_frame, back_frame=None):
     if chase_visible:
         target_choice = raw_path_choice
     else:
-        target_choice = get_stable_path(raw_path_choice, green_choice is not None, hazard_choice is not None)
+        target_choice = get_stable_path(raw_path_choice, (green_choice is not None) or (red_choice is not None), hazard_choice is not None)
         target_choice = apply_boundary_fallback(target_choice, road_mask, width)
-    focused_hazards = hazard_choice['focused_hazards'] if hazard_choice is not None else []
+    if police_avoid_choice is not None and raw_path_choice is police_avoid_choice:
+        focused_hazards = police_avoid_choice['focused_hazards']
+    else:
+        focused_hazards = hazard_choice['focused_hazards'] if hazard_choice is not None else []
     focused_greens = green_choice['focused_tokens'] if green_choice is not None else []
+    focused_reds = red_choice['focused_tokens'] if red_choice is not None else []
     path_lock_state = (
         "chase-override" if chase_override_active else
         ("chase-track" if chase_visible else getattr(get_stable_path, "state_label", "released"))
@@ -1143,7 +1433,7 @@ def analyse_drive(front_frame, back_frame=None):
     if low_light_active:
         acceleration = -1.0
         drive_mode = 'low_light'
-    elif drive_mode in ("avoid", "chase_avoid"):
+    elif drive_mode in ("avoid", "chase_avoid", "police_avoid"):
         acceleration = min(acceleration, 0.72)
 
     debug_frame = front_frame.copy()
@@ -1210,9 +1500,26 @@ def analyse_drive(front_frame, back_frame=None):
             x, y, w, h = token['rect']
             cv2.rectangle(debug_frame, (x - 2, y - 2), (x + w + 2, y + h + 2), (0, 255, 0), 2)
 
+    if focused_reds:
+        red_front_band_y = min(token['rect'][1] for token in focused_reds)
+        cv2.line(debug_frame, (0, red_front_band_y), (width - 1, red_front_band_y), (255, 0, 255), 2)
+        cv2.putText(
+            debug_frame,
+            "red front priority",
+            (10, max(18, red_front_band_y - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (255, 0, 255),
+            2,
+            cv2.LINE_AA
+        )
+        for token in focused_reds:
+            x, y, w, h = token['rect']
+            cv2.rectangle(debug_frame, (x - 2, y - 2), (x + w + 2, y + h + 2), (255, 0, 255), 2)
+
     if target_choice is not None:
         target_x = int(((target_choice['target_x'] + 1.0) * 0.5) * width)
-        target_color = (0, 255, 0)
+        target_color = (0, 255, 0) if target_choice['mode'] != 'police_red' else (0, 0, 255)
         cv2.line(debug_frame, (width // 2, height - 10), (target_x, int(target_choice['target_y'] * height)), target_color, 2)
         cv2.putText(
             debug_frame,
@@ -1245,6 +1552,39 @@ def analyse_drive(front_frame, back_frame=None):
             0.55,
             (0, 200, 255),
             2,
+            cv2.LINE_AA
+        )
+
+    if police_car is not None:
+        x, y, w, h = police_car['rect']
+        cv2.rectangle(debug_frame, (x, y), (x + w, y + h), (255, 0, 255), 2)
+        cv2.putText(
+            debug_frame,
+            f"police {'avoid' if drive_mode == 'police_avoid' else 'active'}",
+            (x, max(18, y - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.50,
+            (255, 0, 255),
+            2,
+            cv2.LINE_AA
+        )
+
+    police_debug = getattr(detect_police_car, "debug", None)
+    if police_debug is not None:
+        rx, ry, rw, rh = police_debug['roi_rect']
+        cv2.rectangle(debug_frame, (rx, ry), (rx + rw, ry + rh), (180, 180, 180), 1)
+        for bx, by, bw, bh in police_debug['red_boxes']:
+            cv2.rectangle(debug_frame, (bx, by), (bx + bw, by + bh), (0, 0, 255), 1)
+        for bx, by, bw, bh in police_debug['blue_boxes']:
+            cv2.rectangle(debug_frame, (bx, by), (bx + bw, by + bh), (255, 0, 0), 1)
+        cv2.putText(
+            debug_frame,
+            "police roi / red / blue",
+            (rx, max(18, ry - 6)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.40,
+            (220, 220, 220),
+            1,
             cv2.LINE_AA
         )
 
