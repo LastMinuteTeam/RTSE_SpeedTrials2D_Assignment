@@ -1445,10 +1445,8 @@ def analyse_drive(front_frame, back_frame=None):
     path_center = normalize_x(center_x, roi_width)
     lane_left_norm = -0.55
     lane_right_norm = 0.55
-
     left_poly = None
     right_poly = None
-
     with data_lock:
         sent_steering = shared_data['sent_steering_input']
         sent_acceleration = shared_data['sent_acceleration_input']
@@ -1458,6 +1456,7 @@ def analyse_drive(front_frame, back_frame=None):
         red_choice = None
         hazard_choice = None
         police_avoid_choice = None
+        edge_escape_choice = None
     else:
         tokens = find_tokens(front_frame, road_mask, roi_top, lane_left_norm, lane_right_norm)
         red_choice = choose_red_target(tokens, path_center) if police_active else None
@@ -1832,7 +1831,7 @@ def analyse_drive(front_frame, back_frame=None):
     )
     is_edge_escape = target_choice.get('is_edge_escape', False) if target_choice is not None else False
 
-    return steering, acceleration, drive_mode, debug_frame, is_edge_escape, back_debug_frame
+    return steering, acceleration, drive_mode, debug_frame, back_debug_frame,is_edge_escape
 
 
 def processing_task():
@@ -1851,7 +1850,12 @@ def processing_task():
         back_frame = shared_data['latest_back_frame']
 
     if front_frame is not None:
-        steering, acceleration, drive_mode, debug_frame, is_edge_escape, back_debug_frame = analyse_drive(front_frame, back_frame)
+        steering, acceleration, drive_mode, debug_frame, back_debug_frame, is_edge_escape = analyse_drive(front_frame, back_frame)
+
+        current_time = time.time()
+        if is_edge_escape and (current_time - processing_task.last_escape_print > 1.0):
+            print("\n[ALERT] !!! EMERGENCY EDGE ESCAPE TRIGGERED !!!\n")
+            processing_task.last_escape_print = current_time
 
         with data_lock:
             shared_data['steering_input'] = steering
