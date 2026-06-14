@@ -38,7 +38,6 @@ ROI_START = 0.30
 PATH_THRESHOLD = 160
 EDGE_LOW = 60
 EDGE_HIGH = 150
-ACCEL_SMOOTHING = 0.35
 TEST_THROTTLE = 1.0
 TOKEN_MIN_AREA = 100
 FAR_TOKEN_MIN_AREA = 30
@@ -65,6 +64,8 @@ CHASE_BACK_SAT_MIN = 60
 CHASE_BACK_VAL_MIN = 45
 CHASE_BACK_MAX_BG_DIFF = 75
 POLICE_HOLD_TIME = 0.40
+POLICE_EVENT_DURATION = 10.0
+POLICE_RED_CLEAR_CONFIRM_TIME = 0.20
 POLICE_ROI_TOP = ROI_START
 POLICE_ROI_BOTTOM = 0.82
 POLICE_ROI_LEFT = 0.18
@@ -76,6 +77,8 @@ POLICE_NEAR_MIN_AREA = 70
 POLICE_NEAR_MIN_Y = 0.40
 POLICE_MIN_BOX_WIDTH = 14
 POLICE_MIN_BOX_HEIGHT = 10
+POLICE_FINAL_MIN_WIDTH = 80
+POLICE_FINAL_MIN_HEIGHT = 12
 POLICE_MAX_BOX_ASPECT = 3.20
 POLICE_MIN_NORM_Y = 0.10
 POLICE_RED_BGR_MIN = np.array([0, 0, 85], dtype=np.uint8)
@@ -602,6 +605,8 @@ def detect_police_car(front_frame):
         if area < police_min_area_for_y(norm_y):
             continue
         if w < POLICE_MIN_BOX_WIDTH or h < POLICE_MIN_BOX_HEIGHT:
+            continue
+        if w < POLICE_FINAL_MIN_WIDTH or h < POLICE_FINAL_MIN_HEIGHT:
             continue
         if (w / max(float(h), 1.0)) > POLICE_MAX_BOX_ASPECT:
             continue
@@ -1168,7 +1173,7 @@ def choose_hazard_avoidance(tokens, path_center, avoid_red=True):
     }
 
 
-def get_stable_path(path_choice, green_still_visible, hazard_still_blocking):
+def get_stable_path(path_choice, green_still_visible, hazard_still_blocking, police_still_blocking=False):
     current_time = time.time()
 
     if not hasattr(get_stable_path, "held_path"):
@@ -1190,8 +1195,8 @@ def get_stable_path(path_choice, green_still_visible, hazard_still_blocking):
         held_path is not None and
         held_path.get('mode') == 'green' and
         path_choice is not None and
-        path_choice.get('mode') == 'avoid' and
-        hazard_still_blocking
+        path_choice.get('mode') in ('avoid', 'police_avoid') and
+        (hazard_still_blocking or police_still_blocking)
     ):
         get_stable_path.held_path = dict(path_choice)
         get_stable_path.last_seen_time = current_time
@@ -1200,6 +1205,12 @@ def get_stable_path(path_choice, green_still_visible, hazard_still_blocking):
         return get_stable_path.held_path
 
     if held_path is not None and held_path.get('mode') == 'avoid' and not hazard_still_blocking:
+        get_stable_path.held_path = None
+        get_stable_path.green_centered = False
+        get_stable_path.state_label = "released"
+        held_path = None
+
+    if held_path is not None and held_path.get('mode') == 'police_avoid' and not police_still_blocking:
         get_stable_path.held_path = None
         get_stable_path.green_centered = False
         get_stable_path.state_label = "released"
@@ -1321,12 +1332,22 @@ def apply_boundary_fallback(target_choice, road_mask, frame_width):
 def analyse_drive(front_frame, back_frame=None):
     if not hasattr(analyse_drive, "chase_override_active"):
         analyse_drive.chase_override_active = False
+    if not hasattr(analyse_drive, "police_event_until"):
+        analyse_drive.police_event_until = 0.0
+    if not hasattr(analyse_drive, "police_red_centered"):
+        analyse_drive.police_red_centered = False
+    if not hasattr(analyse_drive, "police_red_missing_since"):
+        analyse_drive.police_red_missing_since = None
 
     height, width = front_frame.shape[:2]
+    current_time = time.time()
     low_light_active, scene_brightness, bright_pixel_ratio = detect_low_light(front_frame)
     chasing_car = detect_chasing_car(back_frame)
     police_car = None if low_light_active else detect_police_car(front_frame)
-    police_active = police_car is not None
+    if police_car is not None:
+        analyse_drive.police_event_until = max(analyse_drive.police_event_until, current_time + POLICE_EVENT_DURATION)
+    police_active = current_time < analyse_drive.police_event_until
+    police_time_left = max(0.0, analyse_drive.police_event_until - current_time)
     if chasing_car is not None and chasing_car.get('near', False):
         analyse_drive.chase_override_active = True
     elif chasing_car is None:
@@ -1375,7 +1396,9 @@ def analyse_drive(front_frame, back_frame=None):
     hazard_front_priority = hazard_choice.get('front_priority_score', -1.0) if hazard_choice is not None else -1.0
     police_front_priority = police_avoid_choice.get('front_priority_score', -1.0) if police_avoid_choice is not None else -1.0
 
-    if chase_visible:
+    if police_avoid_choice is not None:
+        raw_path_choice = police_avoid_choice
+    elif chase_visible:
         mirrored_chase_x = -chasing_car['norm_x']
         chase_direction = -1.0 if mirrored_chase_x >= 0.0 else 1.0
         raw_path_choice = {
@@ -1384,8 +1407,6 @@ def analyse_drive(front_frame, back_frame=None):
             'target_y': 0.76,
             'strength': 1.0 if chase_override_active else 0.82
         }
-    elif police_avoid_choice is not None and police_front_priority >= red_front_priority:
-        raw_path_choice = police_avoid_choice
     elif police_active and red_choice is not None and red_front_priority >= green_front_priority:
         raw_path_choice = red_choice
     elif (
@@ -1404,7 +1425,12 @@ def analyse_drive(front_frame, back_frame=None):
     if chase_visible:
         target_choice = raw_path_choice
     else:
-        target_choice = get_stable_path(raw_path_choice, (green_choice is not None) or (red_choice is not None), hazard_choice is not None)
+        target_choice = get_stable_path(
+            raw_path_choice,
+            (green_choice is not None) or (red_choice is not None),
+            hazard_choice is not None,
+            police_avoid_choice is not None
+        )
         target_choice = apply_boundary_fallback(target_choice, road_mask, width)
     if police_avoid_choice is not None and raw_path_choice is police_avoid_choice:
         focused_hazards = police_avoid_choice['focused_hazards']
@@ -1429,12 +1455,34 @@ def analyse_drive(front_frame, back_frame=None):
             steering = 0.0
         drive_mode = target_choice['mode']
 
+    if police_active:
+        if red_choice is not None:
+            analyse_drive.police_red_missing_since = None
+        if drive_mode == 'police_red' and target_choice is not None and abs(target_choice['target_x']) <= PATH_RELEASE_CENTER_THRESHOLD:
+            analyse_drive.police_red_centered = True
+        if (
+            analyse_drive.police_red_centered and
+            red_choice is None and
+            police_avoid_choice is None
+        ):
+            if analyse_drive.police_red_missing_since is None:
+                analyse_drive.police_red_missing_since = current_time
+            elif (current_time - analyse_drive.police_red_missing_since) >= POLICE_RED_CLEAR_CONFIRM_TIME:
+                analyse_drive.police_event_until = current_time
+                police_active = False
+                police_time_left = 0.0
+                analyse_drive.police_red_centered = False
+                analyse_drive.police_red_missing_since = None
+        elif red_choice is not None:
+            analyse_drive.police_red_missing_since = None
+    else:
+        analyse_drive.police_red_centered = False
+        analyse_drive.police_red_missing_since = None
+
     acceleration = TEST_THROTTLE
     if low_light_active:
         acceleration = -1.0
         drive_mode = 'low_light'
-    elif drive_mode in ("avoid", "chase_avoid", "police_avoid"):
-        acceleration = min(acceleration, 0.72)
 
     debug_frame = front_frame.copy()
     back_debug_frame = build_back_debug_frame(back_frame, chasing_car)
@@ -1555,6 +1603,18 @@ def analyse_drive(front_frame, back_frame=None):
             cv2.LINE_AA
         )
 
+    if police_active:
+        cv2.putText(
+            debug_frame,
+            f"POLICE EVENT active {police_time_left:.1f}s",
+            (10, 124),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 0, 255),
+            2,
+            cv2.LINE_AA
+        )
+
     if police_car is not None:
         x, y, w, h = police_car['rect']
         cv2.rectangle(debug_frame, (x, y), (x + w, y + h), (255, 0, 255), 2)
@@ -1650,11 +1710,8 @@ def processing_task():
         steering, acceleration, drive_mode, debug_frame, back_debug_frame = analyse_drive(front_frame, back_frame)
 
         with data_lock:
-            previous_acceleration = shared_data['acceleration_input']
-            accel_blend = ACCEL_SMOOTHING
-
             shared_data['steering_input'] = steering
-            shared_data['acceleration_input'] = previous_acceleration * (1.0 - accel_blend) + acceleration * accel_blend
+            shared_data['acceleration_input'] = acceleration
             shared_data['drive_mode'] = drive_mode
             shared_data['debug_frame'] = debug_frame
             shared_data['back_debug_frame'] = back_debug_frame
