@@ -153,6 +153,7 @@ GREEN_FRONT_PRIORITY_WINDOW = 0.12
 GREEN_SIZE_PRIORITY_WEIGHT = 0.75
 GREEN_FRONT_PRIORITY_ADVANTAGE = 0.04
 PATH_RELEASE_CENTER_THRESHOLD = 0.15
+GREEN_HOLD_CENTER_BAND = 0.06
 PATH_LOST_TIMEOUT = 0.75
 ROAD_BOUNDARY_ROW_BAND = 6
 ROAD_BOUNDARY_MARGIN_PIXELS = 6
@@ -1285,7 +1286,7 @@ def get_stable_path(path_choice, green_still_visible, hazard_still_blocking, pol
         held_path = None
 
     if held_path is not None and held_path.get('mode') == 'green':
-        if not get_stable_path.green_centered and abs(held_path['target_x']) <= PATH_RELEASE_CENTER_THRESHOLD:
+        if not get_stable_path.green_centered and abs(held_path['target_x']) <= GREEN_HOLD_CENTER_BAND:
             get_stable_path.green_centered = True
 
         if get_stable_path.green_centered:
@@ -1319,7 +1320,7 @@ def get_stable_path(path_choice, green_still_visible, hazard_still_blocking, pol
             get_stable_path.held_path = dict(path_choice)
             get_stable_path.last_seen_time = current_time
             if get_stable_path.held_path.get('mode') == 'green':
-                if not get_stable_path.green_centered and abs(get_stable_path.held_path['target_x']) <= PATH_RELEASE_CENTER_THRESHOLD:
+                if not get_stable_path.green_centered and abs(get_stable_path.held_path['target_x']) <= GREEN_HOLD_CENTER_BAND:
                     get_stable_path.green_centered = True
                 get_stable_path.state_label = "locked-green-hold" if get_stable_path.green_centered else "locked-green-move"
             else:
@@ -1539,9 +1540,13 @@ def analyse_drive(front_frame, back_frame=None):
 
     drive_mode = 'path'
     steering = 0.0
+    green_hold_aligned = False
 
     if target_choice is not None:
-        if target_choice['target_x'] > 0.0:
+        if target_choice.get('mode') == 'green' and abs(target_choice['target_x']) <= GREEN_HOLD_CENTER_BAND:
+            steering = 0.0
+            green_hold_aligned = True
+        elif target_choice['target_x'] > 0.0:
             steering = 1.0
         elif target_choice['target_x'] < 0.0:
             steering = -1.0
@@ -1582,6 +1587,10 @@ def analyse_drive(front_frame, back_frame=None):
     back_debug_frame = build_back_debug_frame(back_frame, chasing_car)
     cv2.rectangle(debug_frame, (0, roi_top), (width - 1, height - 1), (80, 80, 80), 2)
     cv2.line(debug_frame, (center_x, roi_top), (center_x, height - 1), (255, 0, 0), 2)
+    green_band_half_width = int(width * GREEN_HOLD_CENTER_BAND * 0.5)
+    green_band_left = max(0, center_x - green_band_half_width)
+    green_band_right = min(width - 1, center_x + green_band_half_width)
+    cv2.rectangle(debug_frame, (green_band_left, roi_top), (green_band_right, height - 1), (0, 165, 255), 2)
 
     hsv_debug = cv2.cvtColor(front_frame, cv2.COLOR_BGR2HSV)
 
@@ -1674,6 +1683,18 @@ def analyse_drive(front_frame, back_frame=None):
         for token in focused_greens:
             x, y, w, h = token['rect']
             cv2.rectangle(debug_frame, (x - 2, y - 2), (x + w + 2, y + h + 2), (0, 255, 0), 2)
+
+    if green_hold_aligned:
+        cv2.putText(
+            debug_frame,
+            "green aligned -> hold straight",
+            (10, 148),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.50,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA
+        )
 
     if focused_reds:
         red_front_band_y = min(token['rect'][1] for token in focused_reds)
@@ -1821,7 +1842,7 @@ def analyse_drive(front_frame, back_frame=None):
 
     cv2.putText(
         debug_frame,
-        "Blue=center  Green path=target  Green/Yellow/Red/Gray=detected objects",
+        "Blue=center  Orange band=green hold zone  Green path=target  Green/Yellow/Red/Gray=detected objects",
         (10, height - 12),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.45,
