@@ -45,9 +45,9 @@ HAZARD_MIN_Y = 0.14
 CENTER_LINE_TOLERANCE = 0.04
 CENTER_LINE_SOFTNESS = 0.06
 CHASE_BACK_CENTER_TOLERANCE = 0.10
-CHASE_BACK_HOLD_TIME = 0.50
+CHASE_BACK_HOLD_TIME = 1.50
 CHASE_BACK_MIN_AREA = 28
-CHASE_BACK_FAR_MIN_AREA = 8
+CHASE_BACK_FAR_MIN_AREA = 4
 CHASE_BACK_NEAR_MIN_AREA = 55
 CHASE_BACK_NEAR_MIN_Y = 0.46
 CHASE_BACK_ROI_TOP = 0.42
@@ -501,7 +501,7 @@ def detect_chasing_car(back_frame):
     )
     mask = cv2.bitwise_and(bgr_mask, hsv_mask)
     mask = clean_color_mask(mask)
-    mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=1)
+    mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=2)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     best_detection = None
@@ -1406,6 +1406,8 @@ def analyse_drive(front_frame, back_frame=None):
         analyse_drive.police_red_centered = False
     if not hasattr(analyse_drive, "police_red_missing_since"):
         analyse_drive.police_red_missing_since = None
+    if not hasattr(analyse_drive, "chase_locked_direction"):
+        analyse_drive.chase_locked_direction = 0.0
 
     height, width = front_frame.shape[:2]
     current_time = time.time()
@@ -1488,14 +1490,20 @@ def analyse_drive(front_frame, back_frame=None):
     hazard_front_priority = hazard_choice.get('front_priority_score', -1.0) if hazard_choice is not None else -1.0
     police_front_priority = police_avoid_choice.get('front_priority_score', -1.0) if police_avoid_choice is not None else -1.0
 
+    if not chase_visible:
+        analyse_drive.chase_locked_direction = 0.0
+
     if police_avoid_choice is not None:
         raw_path_choice = police_avoid_choice
     elif chase_visible:
-        mirrored_chase_x = -chasing_car['norm_x']
-        chase_direction = -1.0 if mirrored_chase_x >= 0.0 else 1.0
+        if analyse_drive.chase_locked_direction == 0.0:
+            mirrored_chase_x = -chasing_car['norm_x']
+            analyse_drive.chase_locked_direction = -1.0 if mirrored_chase_x >= 0.0 else 1.0
+            
+        chase_direction = analyse_drive.chase_locked_direction
         raw_path_choice = {
             'mode': 'chase_avoid',
-            'target_x': (0.72 if chase_override_active else 0.52) * chase_direction,
+            'target_x': (0.72 if chase_override_active else 0.58) * chase_direction,
             'target_y': 0.76,
             'strength': 1.0 if chase_override_active else 0.82
         }
