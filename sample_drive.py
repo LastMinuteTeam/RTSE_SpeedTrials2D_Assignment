@@ -49,7 +49,7 @@ EDGE_HIGH = 150
 TEST_THROTTLE = 1.0
 TOKEN_MIN_AREA = 100
 FAR_TOKEN_MIN_AREA = 30
-HAZARD_MIN_Y = 0.14
+HAZARD_MIN_Y = 0.06
 CENTER_LINE_TOLERANCE = 0.04
 CENTER_LINE_SOFTNESS = 0.06
 CHASE_BACK_CENTER_TOLERANCE = 0.10
@@ -153,15 +153,15 @@ GREEN_MAX_OFFSET = 0.80
 HAZARD_OVERRIDE_THREAT = 0.16
 ROAD_LEFT_LIMIT = -0.88
 ROAD_RIGHT_LIMIT = 0.88
-HAZARD_CLEARANCE = 0.10
+HAZARD_CLEARANCE = 0.14
 HAZARD_GAP_GREEN_BONUS = 0.35
 HAZARD_FRONT_PRIORITY_WINDOW = 0.16
-HAZARD_SIZE_PRIORITY_WEIGHT = 0.90
+HAZARD_SIZE_PRIORITY_WEIGHT = 1.20
 GREEN_FRONT_PRIORITY_WINDOW = 0.12
 GREEN_SIZE_PRIORITY_WEIGHT = 0.75
 GREEN_FRONT_PRIORITY_ADVANTAGE = 0.04
 PATH_RELEASE_CENTER_THRESHOLD = 0.15
-GREEN_HOLD_CENTER_BAND = 0.04
+GREEN_HOLD_CENTER_BAND = 0.06
 PATH_LOST_TIMEOUT = 0.75
 ROAD_BOUNDARY_ROW_BAND = 6
 ROAD_BOUNDARY_MARGIN_PIXELS = 6
@@ -1710,7 +1710,7 @@ def choose_hazard_avoidance(tokens, path_center, avoid_red=True):
 
             closeness = clamp((token['norm_y'] - HAZARD_MIN_Y) / (1.0 - HAZARD_MIN_Y), 0.0, 1.0)
             if token_type == 'red':
-                token_weight = 1.35
+                token_weight = 1.60
             elif token_type == 'yellow':
                 token_weight = 1.15
             else:
@@ -1731,7 +1731,7 @@ def choose_hazard_avoidance(tokens, path_center, avoid_red=True):
                 'priority_score': priority_score
             })
 
-    if not blocking_hazards or strongest_threat < 0.18:
+    if not blocking_hazards or strongest_threat < 0.12:
         return None
 
     best_priority_score = max(hazard['priority_score'] for hazard in blocking_hazards)
