@@ -117,14 +117,14 @@ LOW_LIGHT_ABSOLUTE_BRIGHTNESS = 58.0
 LOW_LIGHT_BRIGHT_PIXEL_THRESHOLD = 90
 LOW_LIGHT_MAX_HALF_BRIGHTNESS_GAP = 24.0
 LOW_LIGHT_MAX_HALF_RATIO_GAP = 0.22
-EDGE_MARGIN_RATIO = 0.06
+EDGE_MARGIN_RATIO = 0.02
 MIN_TOKEN_ASPECT = 0.55
 MAX_TOKEN_ASPECT = 1.80
-MIN_ROAD_OVERLAP = 0.55
+MIN_ROAD_OVERLAP = 0.25
 RED_MAX_FILL_RATIO = 0.95
 RED_MIN_COMPACTNESS = 0.22
 LANE_BOUNDARY_MARGIN = 0.06
-RED_STRIPE_MIN_EXTENT = 0.78
+RED_STRIPE_MIN_EXTENT = 0.88
 RED_STRIPE_MIN_AREA = 140
 RED_MAX_MEAN_SATURATION = 210.0
 WHITE_MAX_SATURATION = 35
@@ -2049,8 +2049,8 @@ def analyse_drive(front_frame, back_frame=None):
         player_lane_norm_x = path_center
     else:
         player_lane_norm_x = remap_player_lane_norm_x(player_car['norm_x'])
-    lane_left_norm = -0.55
-    lane_right_norm = 0.55
+    lane_left_norm = -0.85
+    lane_right_norm = 0.85
     left_poly = analyse_drive.left_lane_poly
     right_poly = analyse_drive.right_lane_poly
     with data_lock:
@@ -2119,7 +2119,9 @@ def analyse_drive(front_frame, back_frame=None):
     if not chase_visible:
         analyse_drive.chase_locked_direction = 0.0
 
-    if golden_lane_active and golden_lane_choice is not None:
+    if edge_escape_choice is not None:
+        raw_path_choice = edge_escape_choice
+    elif golden_lane_active and golden_lane_choice is not None:
         raw_path_choice = golden_lane_choice
     elif police_avoid_choice is not None:
         raw_path_choice = police_avoid_choice
@@ -2139,8 +2141,6 @@ def analyse_drive(front_frame, back_frame=None):
         raw_path_choice = red_choice
     elif golden_lane_choice is not None and golden_front_priority >= green_front_priority:
         raw_path_choice = golden_lane_choice
-    elif edge_escape_choice is not None:
-        raw_path_choice = edge_escape_choice
     elif (
         hazard_choice is not None and
         hazard_choice['strength'] >= HAZARD_OVERRIDE_THREAT and
@@ -2154,7 +2154,9 @@ def analyse_drive(front_frame, back_frame=None):
     else:
         raw_path_choice = None
 
-    if golden_lane_active and golden_lane_choice is not None:
+    if edge_escape_choice is not None:
+        target_choice = raw_path_choice
+    elif golden_lane_active and golden_lane_choice is not None:
         target_choice = raw_path_choice
     elif chase_visible:
         target_choice = raw_path_choice
