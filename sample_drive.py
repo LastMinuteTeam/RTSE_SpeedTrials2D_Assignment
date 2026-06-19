@@ -7,6 +7,14 @@ import time
 import keyboard
 import select
 import ctypes
+import os
+import re
+import shutil
+
+try:
+    import pytesseract
+except ImportError:
+    pytesseract = None
 
 # ---------------------------------------------------------
 # Configuration
@@ -41,7 +49,7 @@ EDGE_HIGH = 150
 TEST_THROTTLE = 1.0
 TOKEN_MIN_AREA = 100
 FAR_TOKEN_MIN_AREA = 30
-HAZARD_MIN_Y = 0.14
+HAZARD_MIN_Y = 0.06
 CENTER_LINE_TOLERANCE = 0.04
 CENTER_LINE_SOFTNESS = 0.06
 CHASE_BACK_CENTER_TOLERANCE = 0.10
@@ -64,7 +72,7 @@ CHASE_BACK_SAT_MIN = 60
 CHASE_BACK_VAL_MIN = 45
 CHASE_BACK_MAX_BG_DIFF = 75
 POLICE_HOLD_TIME = 0.40
-POLICE_EVENT_DURATION = 10.0
+POLICE_EVENT_DURATION = 5.0
 POLICE_RED_CLEAR_CONFIRM_TIME = 0.20
 POLICE_ROI_TOP = ROI_START
 POLICE_ROI_BOTTOM = 0.82
@@ -109,14 +117,14 @@ LOW_LIGHT_ABSOLUTE_BRIGHTNESS = 58.0
 LOW_LIGHT_BRIGHT_PIXEL_THRESHOLD = 90
 LOW_LIGHT_MAX_HALF_BRIGHTNESS_GAP = 24.0
 LOW_LIGHT_MAX_HALF_RATIO_GAP = 0.22
-EDGE_MARGIN_RATIO = 0.25
+EDGE_MARGIN_RATIO = 0.02
 MIN_TOKEN_ASPECT = 0.55
 MAX_TOKEN_ASPECT = 1.80
-MIN_ROAD_OVERLAP = 0.55
+MIN_ROAD_OVERLAP = 0.25
 RED_MAX_FILL_RATIO = 0.95
 RED_MIN_COMPACTNESS = 0.22
 LANE_BOUNDARY_MARGIN = 0.06
-RED_STRIPE_MIN_EXTENT = 0.78
+RED_STRIPE_MIN_EXTENT = 0.88
 RED_STRIPE_MIN_AREA = 140
 RED_MAX_MEAN_SATURATION = 210.0
 WHITE_MAX_SATURATION = 35
@@ -145,10 +153,10 @@ GREEN_MAX_OFFSET = 0.80
 HAZARD_OVERRIDE_THREAT = 0.16
 ROAD_LEFT_LIMIT = -0.88
 ROAD_RIGHT_LIMIT = 0.88
-HAZARD_CLEARANCE = 0.10
+HAZARD_CLEARANCE = 0.14
 HAZARD_GAP_GREEN_BONUS = 0.35
 HAZARD_FRONT_PRIORITY_WINDOW = 0.16
-HAZARD_SIZE_PRIORITY_WEIGHT = 0.90
+HAZARD_SIZE_PRIORITY_WEIGHT = 1.20
 GREEN_FRONT_PRIORITY_WINDOW = 0.12
 GREEN_SIZE_PRIORITY_WEIGHT = 0.75
 GREEN_FRONT_PRIORITY_ADVANTAGE = 0.04
@@ -157,6 +165,35 @@ GREEN_HOLD_CENTER_BAND = 0.06
 PATH_LOST_TIMEOUT = 0.75
 ROAD_BOUNDARY_ROW_BAND = 6
 ROAD_BOUNDARY_MARGIN_PIXELS = 6
+LANE_POLY_MIN_POINTS = 7
+LANE_FIT_BLEND = 0.35
+GOLDEN_EVENT_DURATION = 5.0
+GOLDEN_TEXT_ROI_TOP = 0.00
+GOLDEN_TEXT_ROI_BOTTOM = 0.040
+GOLDEN_TEXT_ROI_LEFT = 0.00
+GOLDEN_TEXT_ROI_RIGHT = 1.00
+GOLDEN_TEXT_MIN_COMPONENT_AREA = 12
+GOLDEN_TEXT_MIN_HEIGHT = 6
+GOLDEN_TEXT_MATCH_THRESHOLD = 0.26
+GOLDEN_TEXT_BLACK_MAX_VALUE = 110
+GOLDEN_TEXT_SEARCH_LEFT = 0.36
+GOLDEN_TEXT_SEARCH_RIGHT = 0.78
+GOLDEN_DIGIT_SLOT_LEFT = 0.425
+GOLDEN_DIGIT_SLOT_RIGHT = 0.505
+GOLDEN_LANE_PRIORITY_BONUS = 0.20
+GOLDEN_OCR_INTERVAL = 0.75
+GOLDEN_BANNER_MIN_YELLOW_RATIO = 0.55
+GOLDEN_BANNER_MIN_DARK_RATIO = 0.015
+PLAYER_LANE_SAMPLE_Y = 0.82
+PLAYER_CAR_ROI_TOP = 0.76
+PLAYER_CAR_ROI_LEFT = 0.22
+PLAYER_CAR_ROI_RIGHT = 0.78
+PLAYER_CAR_MIN_AREA = 700
+PLAYER_CAR_LANE_GAIN = 1.15
+PLAYER_CAR_EDGE_GAIN = 1.95
+PLAYER_LANE_SIDE_INSET_RATIO = 0.12
+LANE_OVERLAY_START_OFFSET = 55
+LANE_OVERLAY_STRAIGHT_HEIGHT = 70
 
 
 # ---------------------------------------------------------
@@ -459,6 +496,59 @@ def detect_low_light(frame):
     return detect_low_light.is_active, brightness_mean, bright_pixel_ratio
 
 
+def detect_player_car(frame):
+    height, width = frame.shape[:2]
+    roi_top = int(height * PLAYER_CAR_ROI_TOP)
+    roi_left = int(width * PLAYER_CAR_ROI_LEFT)
+    roi_right = int(width * PLAYER_CAR_ROI_RIGHT)
+    roi = frame[roi_top:, roi_left:roi_right]
+    if roi.size == 0:
+        return None
+
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    red_mask = cv2.bitwise_or(
+        cv2.inRange(hsv, np.array([0, 70, 40]), np.array([16, 255, 255])),
+        cv2.inRange(hsv, np.array([165, 70, 40]), np.array([180, 255, 255]))
+    )
+    red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+
+    contours, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best = None
+    best_area = 0.0
+
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < PLAYER_CAR_MIN_AREA:
+            continue
+
+        x, y, w, h = cv2.boundingRect(contour)
+        center_x = roi_left + x + (w * 0.5)
+        center_y = roi_top + y + (h * 0.5)
+        if center_y < height * 0.82:
+            continue
+
+        if area > best_area:
+            best_area = area
+            best = {
+                'rect': (roi_left + x, roi_top + y, w, h),
+                'norm_x': normalize_x(center_x, width),
+            }
+
+    return best
+
+
+def remap_player_lane_norm_x(norm_x):
+    base = norm_x * PLAYER_CAR_LANE_GAIN
+    magnitude = abs(base)
+    if magnitude <= 0.35:
+        return clamp(base, -1.0, 1.0)
+
+    edge_weight = clamp((magnitude - 0.35) / 0.35, 0.0, 1.0)
+    boosted_magnitude = magnitude + (edge_weight * (PLAYER_CAR_EDGE_GAIN - 1.0) * (magnitude - 0.35))
+    return clamp(np.sign(base) * boosted_magnitude, -1.0, 1.0)
+
+
 def chasing_min_area_for_y(norm_y):
     near_weight = clamp((norm_y - 0.20) / 0.70, 0.0, 1.0)
     return CHASE_BACK_FAR_MIN_AREA + ((CHASE_BACK_MIN_AREA - CHASE_BACK_FAR_MIN_AREA) * near_weight)
@@ -753,6 +843,461 @@ def build_back_debug_frame(back_frame, chasing_car):
     return debug_back
 
 
+def blend_poly(previous_poly, new_poly, alpha):
+    if previous_poly is None:
+        return new_poly
+    previous_coeffs = np.array(previous_poly.c, dtype=np.float32)
+    new_coeffs = np.array(new_poly.c, dtype=np.float32)
+    blended_coeffs = ((1.0 - alpha) * previous_coeffs) + (alpha * new_coeffs)
+    return np.poly1d(blended_coeffs)
+
+
+def fit_lane_polynomials(road_mask, previous_left=None, previous_right=None):
+    roi_height, _ = road_mask.shape[:2]
+    points_y = []
+    left_points_x = []
+    right_points_x = []
+
+    for current_y in range(roi_height - 1, 0, -5):
+        row_pixels = road_mask[current_y, :]
+        occupied = np.where(row_pixels > 0)[0]
+        if occupied.size > 0:
+            points_y.append(current_y)
+            left_points_x.append(occupied[0])
+            right_points_x.append(occupied[-1])
+
+    if len(points_y) < LANE_POLY_MIN_POINTS:
+        return previous_left, previous_right
+
+    fitted_left = np.poly1d(np.polyfit(points_y, left_points_x, 2))
+    fitted_right = np.poly1d(np.polyfit(points_y, right_points_x, 2))
+    return (
+        blend_poly(previous_left, fitted_left, LANE_FIT_BLEND),
+        blend_poly(previous_right, fitted_right, LANE_FIT_BLEND),
+    )
+
+
+def get_lane_bounds(norm_y, road_mask, frame_width, frame_height, roi_top, left_poly=None, right_poly=None):
+    y_px = int(norm_y * frame_height)
+    roi_y = y_px - roi_top
+    if roi_y < 0 or roi_y >= road_mask.shape[0]:
+        return None
+
+    if left_poly is not None and right_poly is not None:
+        left_px = int(left_poly(roi_y))
+        right_px = int(right_poly(roi_y))
+    else:
+        row_pixels = road_mask[roi_y, :]
+        occupied_columns = np.where(row_pixels > 0)[0]
+        if occupied_columns.size == 0:
+            return None
+        left_px = int(occupied_columns[0])
+        right_px = int(occupied_columns[-1])
+
+    if right_px <= left_px:
+        return None
+    return left_px, right_px
+
+
+def get_lane_center_norm(lane_index, norm_y, road_mask, frame_width, frame_height, roi_top, left_poly=None, right_poly=None):
+    bounds = get_lane_bounds(norm_y, road_mask, frame_width, frame_height, roi_top, left_poly, right_poly)
+    if bounds is None:
+        lane_index = int(clamp(lane_index, 1, 5))
+        fallback_centers = [-0.60, -0.30, 0.0, 0.30, 0.60]
+        return fallback_centers[lane_index - 1]
+
+    left_px, right_px = bounds
+    road_width = right_px - left_px
+    lane_index = int(clamp(lane_index, 1, 5))
+    lane_center_px = left_px + ((lane_index - 0.5) * (road_width / 5.0))
+    return normalize_x(lane_center_px, frame_width)
+
+
+def get_player_effective_lane_bounds(left_px, right_px):
+    road_width = right_px - left_px
+    inset = road_width * PLAYER_LANE_SIDE_INSET_RATIO
+    effective_left = int(left_px + inset)
+    effective_right = int(right_px - inset)
+    if effective_right <= effective_left:
+        return left_px, right_px
+    return effective_left, effective_right
+
+
+def get_player_lane_reference_bounds(road_mask, frame_width, frame_height, roi_top, left_poly=None, right_poly=None):
+    bounds = get_lane_bounds(PLAYER_LANE_SAMPLE_Y, road_mask, frame_width, frame_height, roi_top, left_poly, right_poly)
+    if bounds is None:
+        return None
+    return get_player_effective_lane_bounds(bounds[0], bounds[1])
+
+
+def build_golden_lane_templates():
+    patterns = {
+        1: [
+            "000111000000",
+            "001111000000",
+            "000111000000",
+            "000111000000",
+            "000111000000",
+            "000111000000",
+            "000111000000",
+            "000111000000",
+            "000111000000",
+            "000111000000",
+            "000111000000",
+            "000111000000",
+            "000111000000",
+            "000111000000",
+            "000111000000",
+            "000111000000",
+            "001111100000",
+            "001111100000",
+        ],
+        2: [
+            "001111110000",
+            "011111111000",
+            "111000111100",
+            "000000111100",
+            "000000111000",
+            "000001110000",
+            "000011100000",
+            "000111000000",
+            "001110000000",
+            "011100000000",
+            "111000000000",
+            "111000000000",
+            "111000000000",
+            "111000000000",
+            "111000000000",
+            "111111111100",
+            "111111111100",
+            "111111111100",
+        ],
+        3: [
+            "001111110000",
+            "011111111000",
+            "111000111100",
+            "000000111100",
+            "000000111000",
+            "000001110000",
+            "000111100000",
+            "000111100000",
+            "000011110000",
+            "000000111000",
+            "000000011100",
+            "000000011100",
+            "000000011100",
+            "000000111100",
+            "111000111100",
+            "011111111000",
+            "001111110000",
+            "000111100000",
+        ],
+        4: [
+            "000001111000",
+            "000011111000",
+            "000111111000",
+            "001111111000",
+            "001110111000",
+            "011100111000",
+            "111000111000",
+            "111000111000",
+            "111000111000",
+            "111111111100",
+            "111111111100",
+            "000000111000",
+            "000000111000",
+            "000000111000",
+            "000000111000",
+            "000000111000",
+            "000001111100",
+            "000001111100",
+        ],
+        5: [
+            "111111111100",
+            "111111111100",
+            "111111111100",
+            "111000000000",
+            "111000000000",
+            "111000000000",
+            "111111110000",
+            "111111111000",
+            "111000111100",
+            "000000011100",
+            "000000011100",
+            "000000011100",
+            "000000011100",
+            "000000111100",
+            "111000111100",
+            "011111111000",
+            "001111110000",
+            "000111100000",
+        ],
+    }
+
+    templates = {}
+    for digit, rows in patterns.items():
+        array = np.array([[255 if ch == '1' else 0 for ch in row] for row in rows], dtype=np.uint8)
+        templates[digit] = array
+    return templates
+
+
+def match_digit_template(binary_digit, templates):
+    resized = cv2.resize(binary_digit, (12, 18), interpolation=cv2.INTER_NEAREST)
+    _, resized = cv2.threshold(resized, 127, 255, cv2.THRESH_BINARY)
+    best_digit = None
+    best_score = -1.0
+    resized_bool = resized > 0
+    for digit, template in templates.items():
+        template_bool = template > 0
+        intersection = np.logical_and(resized_bool, template_bool).sum()
+        union = np.logical_or(resized_bool, template_bool).sum()
+        if union == 0:
+            continue
+        iou = intersection / union
+
+        resized_fill = resized_bool.mean()
+        template_fill = template_bool.mean()
+        fill_penalty = abs(resized_fill - template_fill)
+
+        score = float(iou - (0.35 * fill_penalty))
+        if score > best_score:
+            best_score = score
+            best_digit = digit
+    return best_digit, float(best_score)
+
+
+def detect_golden_lane_number_ocr(frame):
+    if pytesseract is None:
+        return None
+    executable = None
+    for candidate in (
+        shutil.which("tesseract"),
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+    ):
+        if candidate and os.path.exists(candidate):
+            executable = candidate
+            break
+    if executable is None:
+        detect_golden_lane_number_ocr.available = False
+        detect_golden_lane_number_ocr.executable = None
+        detect_golden_lane_number_ocr.last_text = None
+        return None
+    pytesseract.pytesseract.tesseract_cmd = executable
+    detect_golden_lane_number_ocr.available = True
+    detect_golden_lane_number_ocr.executable = executable
+
+    height, width = frame.shape[:2]
+    roi_top = int(height * GOLDEN_TEXT_ROI_TOP)
+    roi_bottom = int(height * GOLDEN_TEXT_ROI_BOTTOM)
+    roi = frame[roi_top:roi_bottom, :]
+    if roi.size == 0:
+        return None
+
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    yellow_mask = cv2.inRange(hsv, np.array([15, 80, 140]), np.array([40, 255, 255]))
+    yellow_ratio = float(np.count_nonzero(yellow_mask)) / max(float(yellow_mask.size), 1.0)
+    yellow_only = cv2.bitwise_and(gray, gray, mask=yellow_mask)
+    dark_ratio = float(np.count_nonzero(yellow_only <= GOLDEN_TEXT_BLACK_MAX_VALUE)) / max(float(yellow_only.size), 1.0)
+    if yellow_ratio < GOLDEN_BANNER_MIN_YELLOW_RATIO or dark_ratio < GOLDEN_BANNER_MIN_DARK_RATIO:
+        detect_golden_lane_number_ocr.last_text = None
+        return None
+    _, dark_mask = cv2.threshold(yellow_only, GOLDEN_TEXT_BLACK_MAX_VALUE, 255, cv2.THRESH_BINARY_INV)
+    text_mask = cv2.bitwise_and(dark_mask, yellow_mask)
+    text_mask = cv2.morphologyEx(text_mask, cv2.MORPH_OPEN, np.ones((2, 1), np.uint8))
+    text_mask = cv2.dilate(text_mask, np.ones((2, 2), np.uint8), iterations=1)
+    raw_gray_up = cv2.resize(gray, None, fx=8.0, fy=8.0, interpolation=cv2.INTER_CUBIC)
+    _, raw_bw = cv2.threshold(raw_gray_up, 150, 255, cv2.THRESH_BINARY_INV)
+    masked_up = cv2.resize(text_mask, None, fx=8.0, fy=8.0, interpolation=cv2.INTER_NEAREST)
+    masked_white = cv2.bitwise_not(masked_up)
+    yellow_up = cv2.resize(yellow_only, None, fx=8.0, fy=8.0, interpolation=cv2.INTER_CUBIC)
+    _, yellow_bw = cv2.threshold(yellow_up, GOLDEN_TEXT_BLACK_MAX_VALUE, 255, cv2.THRESH_BINARY_INV)
+
+    ocr_variants = [
+        cv2.copyMakeBorder(raw_bw, 12, 12, 12, 12, cv2.BORDER_CONSTANT, value=255),
+        cv2.copyMakeBorder(masked_white, 12, 12, 12, 12, cv2.BORDER_CONSTANT, value=255),
+        cv2.copyMakeBorder(yellow_bw, 12, 12, 12, 12, cv2.BORDER_CONSTANT, value=255),
+    ]
+    ocr_configs = [
+        "--psm 7 -c tessedit_char_whitelist=LANE12345-()SGR! ",
+        "--psm 6 -c tessedit_char_whitelist=LANE12345-()SGR! ",
+        "--psm 13 -c tessedit_char_whitelist=LANE12345-()SGR! ",
+    ]
+
+    best_text = ""
+    best_lane = None
+    for ocr_input in ocr_variants:
+        for config in ocr_configs:
+            try:
+                text = pytesseract.image_to_string(ocr_input, config=config)
+            except Exception:
+                continue
+
+            text = text.upper().strip()
+            if not text:
+                continue
+
+            lane_match = re.search(r"LANE\D*([1-5])", text)
+            if lane_match:
+                best_text = text
+                best_lane = int(lane_match.group(1))
+                break
+
+            digit_match = re.search(r"([1-5])", text)
+            if digit_match is not None and best_lane is None:
+                best_text = text
+                best_lane = int(digit_match.group(1))
+        if best_lane is not None and "LANE" in best_text:
+            break
+
+    detect_golden_lane_number_ocr.last_text = best_text or None
+    if best_lane is None:
+        return None
+
+    return {
+        'lane': best_lane,
+        'score': 1.0,
+        'rect': (0, roi_top, width, roi_bottom - roi_top),
+        'ocr_text': best_text,
+    }
+
+
+def detect_golden_lane_number(frame):
+    if not hasattr(detect_golden_lane_number, "templates"):
+        detect_golden_lane_number.templates = build_golden_lane_templates()
+        detect_golden_lane_number.debug = None
+        detect_golden_lane_number.last_ocr_time = 0.0
+        detect_golden_lane_number.last_ocr_result = None
+        detect_golden_lane_number.last_ocr_debug_text = None
+
+    current_time = time.time()
+    if current_time - detect_golden_lane_number.last_ocr_time >= GOLDEN_OCR_INTERVAL:
+        detect_golden_lane_number.last_ocr_time = current_time
+        detect_golden_lane_number.last_ocr_result = detect_golden_lane_number_ocr(frame)
+        detect_golden_lane_number.last_ocr_debug_text = (
+            None if detect_golden_lane_number.last_ocr_result is None
+            else detect_golden_lane_number.last_ocr_result.get('ocr_text')
+        )
+
+    if detect_golden_lane_number.last_ocr_result is not None:
+        height, width = frame.shape[:2]
+        roi_top = int(height * GOLDEN_TEXT_ROI_TOP)
+        roi_bottom = int(height * GOLDEN_TEXT_ROI_BOTTOM)
+        detect_golden_lane_number.debug = {
+            'roi_rect': (0, roi_top, width, roi_bottom - roi_top),
+            'search_rect': None,
+            'phrase_rect': None,
+            'candidate_boxes': [],
+            'best_rect': detect_golden_lane_number.last_ocr_result['rect'],
+            'best_lane': detect_golden_lane_number.last_ocr_result['lane'],
+            'best_score': detect_golden_lane_number.last_ocr_result['score'],
+            'ocr_text': detect_golden_lane_number.last_ocr_debug_text,
+            'ocr_available': True,
+            'ocr_active': True,
+        }
+        return detect_golden_lane_number.last_ocr_result
+
+    height, width = frame.shape[:2]
+    roi_top = int(height * GOLDEN_TEXT_ROI_TOP)
+    roi_bottom = int(height * GOLDEN_TEXT_ROI_BOTTOM)
+    roi_left = int(width * GOLDEN_TEXT_ROI_LEFT)
+    roi_right = int(width * GOLDEN_TEXT_ROI_RIGHT)
+    roi = frame[roi_top:roi_bottom, roi_left:roi_right]
+    if roi.size == 0:
+        detect_golden_lane_number.debug = None
+        return None
+
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    yellow_mask = cv2.inRange(hsv, np.array([15, 80, 140]), np.array([40, 255, 255]))
+    yellow_mask = cv2.morphologyEx(yellow_mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+
+    dark_text_mask = cv2.inRange(gray, 0, GOLDEN_TEXT_BLACK_MAX_VALUE)
+    text_mask = cv2.bitwise_and(dark_text_mask, yellow_mask)
+    text_mask = cv2.morphologyEx(text_mask, cv2.MORPH_OPEN, np.ones((2, 1), np.uint8))
+    best = None
+    candidate_boxes = []
+    search_left = int(roi.shape[1] * 0.39)
+    search_right = int(roi.shape[1] * 0.49)
+    search_rect = (roi_left + search_left, roi_top, search_right - search_left, roi_bottom - roi_top)
+    window_width = max(8, int(roi.shape[1] * 0.022))
+    step = max(2, int(roi.shape[1] * 0.004))
+    target_center_x = roi.shape[1] * 0.443
+
+    for x0 in range(search_left, max(search_left + 1, search_right - window_width + 1), step):
+        x1 = x0 + window_width
+        window_mask = text_mask[:, x0:x1]
+        if np.count_nonzero(window_mask) < GOLDEN_TEXT_MIN_COMPONENT_AREA:
+            continue
+
+        row_activity = np.count_nonzero(window_mask, axis=1)
+        active_rows = np.where(row_activity >= 1)[0]
+        if active_rows.size == 0:
+            continue
+
+        col_activity = np.count_nonzero(window_mask, axis=0)
+        active_cols = np.where(col_activity >= 1)[0]
+        if active_cols.size == 0:
+            continue
+
+        bx0 = x0 + int(active_cols[0])
+        bx1 = x0 + int(active_cols[-1] + 1)
+        by0 = int(active_rows[0])
+        by1 = int(active_rows[-1] + 1)
+        bw = int(bx1 - bx0)
+        bh = int(by1 - by0)
+        area = int(np.count_nonzero(text_mask[by0:by1, bx0:bx1]))
+        if area < GOLDEN_TEXT_MIN_COMPONENT_AREA:
+            continue
+        if bw < 3 or bh < 8:
+            continue
+        if bw > max(14, int(roi.shape[1] * 0.020)):
+            continue
+        aspect_ratio = bw / max(float(bh), 1.0)
+        if aspect_ratio < 0.10 or aspect_ratio > 0.95:
+            continue
+
+        candidate_boxes.append((bx0 + roi_left, by0 + roi_top, bw, bh))
+        digit_patch = text_mask[by0:by1, bx0:bx1]
+        digit, score = match_digit_template(digit_patch, detect_golden_lane_number.templates)
+        if digit is None:
+            continue
+
+        center_x = bx0 + (bw * 0.5)
+        center_penalty = abs(center_x - target_center_x) / max(float(roi.shape[1]), 1.0)
+        weighted_score = float(score - (0.45 * center_penalty))
+
+        if weighted_score >= GOLDEN_TEXT_MATCH_THRESHOLD and (best is None or weighted_score > best['score']):
+            best = {
+                'lane': int(digit),
+                'score': weighted_score,
+                'raw_score': float(score),
+                'rect': (bx0 + roi_left, by0 + roi_top, bw, bh)
+            }
+
+    detect_golden_lane_number.debug = {
+        'roi_rect': (roi_left, roi_top, roi_right - roi_left, roi_bottom - roi_top),
+        'search_rect': search_rect,
+        'phrase_rect': None,
+        'candidate_boxes': candidate_boxes,
+        'best_rect': None if best is None else best['rect'],
+        'best_lane': None if best is None else best['lane'],
+        'best_score': None if best is None else best['score'],
+        'ocr_text': (
+            detect_golden_lane_number.last_ocr_debug_text
+            if detect_golden_lane_number.last_ocr_debug_text is not None
+            else getattr(detect_golden_lane_number_ocr, 'last_text', None)
+        ),
+        'ocr_available': getattr(detect_golden_lane_number_ocr, 'available', False),
+        'ocr_active': False,
+    }
+
+    if best is None:
+        return None
+    return best
+
+
 def clean_color_mask(mask):
     kernel = np.ones((3, 3), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
@@ -969,7 +1514,7 @@ def choose_green_target(tokens, path_center):
         'focused_tokens': [entry['token'] for entry in focused_targets]
     }
 
-def get_lane_index(norm_x, norm_y, road_mask, frame_width, frame_height, roi_top, left_poly=None, right_poly=None):
+def get_lane_index(norm_x, norm_y, road_mask, frame_width, frame_height, roi_top, left_poly=None, right_poly=None, use_player_bounds=False):
     """
     Calculates the lane dynamically. Uses Mathematical Polynomials if available
     for perfect curves, otherwise falls back to raw pixel scanning.
@@ -980,7 +1525,19 @@ def get_lane_index(norm_x, norm_y, road_mask, frame_width, frame_height, roi_top
     if roi_y < 0 or roi_y >= road_mask.shape[0]:
         return 3
 
-    if left_poly is not None and right_poly is not None:
+    if use_player_bounds:
+        reference_bounds = get_player_lane_reference_bounds(
+            road_mask,
+            frame_width,
+            frame_height,
+            roi_top,
+            left_poly,
+            right_poly
+        )
+        if reference_bounds is None:
+            return 3
+        left_px, right_px = reference_bounds
+    elif left_poly is not None and right_poly is not None:
         left_px = int(left_poly(roi_y))
         right_px = int(right_poly(roi_y))
     else:
@@ -1004,7 +1561,17 @@ def get_lane_index(norm_x, norm_y, road_mask, frame_width, frame_height, roi_top
     else: return 5
 
 def check_edge_lane_escape(tokens, path_center, road_mask, frame_width, frame_height, roi_top, left_poly=None, right_poly=None):
-    current_lane = get_lane_index(path_center, 0.95, road_mask, frame_width, frame_height, roi_top, left_poly, right_poly)
+    current_lane = get_lane_index(
+        path_center,
+        PLAYER_LANE_SAMPLE_Y,
+        road_mask,
+        frame_width,
+        frame_height,
+        roi_top,
+        left_poly,
+        right_poly,
+        use_player_bounds=True
+    )
 
     if current_lane not in [1, 5]:
         return None
@@ -1143,7 +1710,7 @@ def choose_hazard_avoidance(tokens, path_center, avoid_red=True):
 
             closeness = clamp((token['norm_y'] - HAZARD_MIN_Y) / (1.0 - HAZARD_MIN_Y), 0.0, 1.0)
             if token_type == 'red':
-                token_weight = 1.35
+                token_weight = 1.60
             elif token_type == 'yellow':
                 token_weight = 1.15
             else:
@@ -1164,7 +1731,7 @@ def choose_hazard_avoidance(tokens, path_center, avoid_red=True):
                 'priority_score': priority_score
             })
 
-    if not blocking_hazards or strongest_threat < 0.18:
+    if not blocking_hazards or strongest_threat < 0.12:
         return None
 
     best_priority_score = max(hazard['priority_score'] for hazard in blocking_hazards)
@@ -1239,6 +1806,24 @@ def choose_hazard_avoidance(tokens, path_center, avoid_red=True):
         'focused_hazards': focused_hazards,
         'gap_centers': sorted({entry[1] for entry in candidate_targets}),
         'front_priority_score': best_priority_score
+    }
+
+
+def choose_golden_lane_target(target_lane, current_lane, road_mask, frame_width, frame_height, roi_top, left_poly=None, right_poly=None):
+    if target_lane is None:
+        return None
+
+    lane_center = get_lane_center_norm(target_lane, 0.88, road_mask, frame_width, frame_height, roi_top, left_poly, right_poly)
+    current_lane = int(clamp(current_lane, 1, 5))
+    lane_distance = abs(target_lane - current_lane)
+    strength = 0.80 + (GOLDEN_LANE_PRIORITY_BONUS * max(0, 3 - lane_distance))
+    return {
+        'mode': 'golden_lane',
+        'target_x': lane_center,
+        'target_y': 0.80,
+        'strength': strength,
+        'target_lane': target_lane,
+        'front_priority_score': 10.0 + max(0, 4 - lane_distance)
     }
 
 
@@ -1409,6 +1994,14 @@ def analyse_drive(front_frame, back_frame=None):
         analyse_drive.police_red_missing_since = None
     if not hasattr(analyse_drive, "chase_locked_direction"):
         analyse_drive.chase_locked_direction = 0.0
+    if not hasattr(analyse_drive, "left_lane_poly"):
+        analyse_drive.left_lane_poly = None
+    if not hasattr(analyse_drive, "right_lane_poly"):
+        analyse_drive.right_lane_poly = None
+    if not hasattr(analyse_drive, "golden_lane_until"):
+        analyse_drive.golden_lane_until = 0.0
+    if not hasattr(analyse_drive, "golden_lane_target"):
+        analyse_drive.golden_lane_target = None
 
     height, width = front_frame.shape[:2]
     current_time = time.time()
@@ -1443,16 +2036,42 @@ def analyse_drive(front_frame, back_frame=None):
     path_mask = cv2.dilate(path_mask, kernel, iterations=2)
 
     road_mask = build_road_mask(path_mask)
+    analyse_drive.left_lane_poly, analyse_drive.right_lane_poly = fit_lane_polynomials(
+        road_mask,
+        analyse_drive.left_lane_poly,
+        analyse_drive.right_lane_poly
+    )
 
     center_x = roi_width // 2
     path_center = normalize_x(center_x, roi_width)
-    lane_left_norm = -0.55
-    lane_right_norm = 0.55
-    left_poly = None
-    right_poly = None
+    player_car = None if low_light_active else detect_player_car(front_frame)
+    if player_car is None:
+        player_lane_norm_x = path_center
+    else:
+        player_lane_norm_x = remap_player_lane_norm_x(player_car['norm_x'])
+    lane_left_norm = -0.85
+    lane_right_norm = 0.85
+    left_poly = analyse_drive.left_lane_poly
+    right_poly = analyse_drive.right_lane_poly
     with data_lock:
         sent_steering = shared_data['sent_steering_input']
         sent_acceleration = shared_data['sent_acceleration_input']
+    golden_lane_active = (
+        analyse_drive.golden_lane_target is not None and
+        current_time < analyse_drive.golden_lane_until
+    )
+    golden_lane_detection = None if (low_light_active or golden_lane_active) else detect_golden_lane_number(front_frame)
+    if golden_lane_detection is not None:
+        analyse_drive.golden_lane_until = current_time + GOLDEN_EVENT_DURATION
+        analyse_drive.golden_lane_target = golden_lane_detection['lane']
+    golden_lane_active = (
+        analyse_drive.golden_lane_target is not None and
+        current_time < analyse_drive.golden_lane_until
+    )
+    golden_lane_time_left = max(0.0, analyse_drive.golden_lane_until - current_time)
+    if not golden_lane_active:
+        analyse_drive.golden_lane_target = None
+
     if low_light_active:
         tokens = {'green': [], 'yellow': [], 'red': [], 'gray': []}
         green_choice = None
@@ -1460,41 +2079,51 @@ def analyse_drive(front_frame, back_frame=None):
         hazard_choice = None
         police_avoid_choice = None
         edge_escape_choice = None
+        golden_lane_choice = None
+        current_lane = 3
     else:
         tokens = find_tokens(front_frame, road_mask, roi_top, lane_left_norm, lane_right_norm)
         red_choice = choose_red_target(tokens, path_center) if police_active else None
         police_avoid_choice = choose_police_car_avoidance(police_car, path_center) if police_active else None
-
-        points_y = []
-        left_points_x = []
-        right_points_x = []
-
-        for current_y in range(roi_height - 1, 0, -5):
-            row_pixels = road_mask[current_y, :]
-            occupied = np.where(row_pixels > 0)[0]
-            if occupied.size > 0:
-                points_y.append(current_y)
-                left_points_x.append(occupied[0])
-                right_points_x.append(occupied[-1])
-
-        if len(points_y) > 10:
-            left_poly = np.poly1d(np.polyfit(points_y, left_points_x, 2))
-            right_poly = np.poly1d(np.polyfit(points_y, right_points_x, 2))
-
-        edge_escape_choice = check_edge_lane_escape(tokens, path_center, road_mask, width, height, roi_top, left_poly, right_poly)
-
+        current_lane = get_lane_index(
+            player_lane_norm_x,
+            PLAYER_LANE_SAMPLE_Y,
+            road_mask,
+            width,
+            height,
+            roi_top,
+            left_poly,
+            right_poly,
+            use_player_bounds=True
+        )
+        edge_escape_choice = check_edge_lane_escape(tokens, player_lane_norm_x, road_mask, width, height, roi_top, left_poly, right_poly)
         green_choice = choose_green_target(tokens, path_center)
         hazard_choice = choose_hazard_avoidance(tokens, path_center)
+        golden_lane_choice = choose_golden_lane_target(
+            analyse_drive.golden_lane_target,
+            current_lane,
+            road_mask,
+            width,
+            height,
+            roi_top,
+            left_poly,
+            right_poly
+        ) if golden_lane_active else None
 
     green_front_priority = green_choice.get('front_priority_score', -1.0) if green_choice is not None else -1.0
     red_front_priority = red_choice.get('front_priority_score', -1.0) if red_choice is not None else -1.0
     hazard_front_priority = hazard_choice.get('front_priority_score', -1.0) if hazard_choice is not None else -1.0
     police_front_priority = police_avoid_choice.get('front_priority_score', -1.0) if police_avoid_choice is not None else -1.0
+    golden_front_priority = golden_lane_choice.get('front_priority_score', -1.0) if golden_lane_choice is not None else -1.0
 
     if not chase_visible:
         analyse_drive.chase_locked_direction = 0.0
 
-    if police_avoid_choice is not None:
+    if edge_escape_choice is not None:
+        raw_path_choice = edge_escape_choice
+    elif golden_lane_active and golden_lane_choice is not None:
+        raw_path_choice = golden_lane_choice
+    elif police_avoid_choice is not None:
         raw_path_choice = police_avoid_choice
     elif chase_visible:
         if analyse_drive.chase_locked_direction == 0.0:
@@ -1510,8 +2139,8 @@ def analyse_drive(front_frame, back_frame=None):
         }
     elif police_active and red_choice is not None and red_front_priority >= green_front_priority:
         raw_path_choice = red_choice
-    elif edge_escape_choice is not None:
-        raw_path_choice = edge_escape_choice
+    elif golden_lane_choice is not None and golden_front_priority >= green_front_priority:
+        raw_path_choice = golden_lane_choice
     elif (
         hazard_choice is not None and
         hazard_choice['strength'] >= HAZARD_OVERRIDE_THREAT and
@@ -1525,7 +2154,11 @@ def analyse_drive(front_frame, back_frame=None):
     else:
         raw_path_choice = None
 
-    if chase_visible:
+    if edge_escape_choice is not None:
+        target_choice = raw_path_choice
+    elif golden_lane_active and golden_lane_choice is not None:
+        target_choice = raw_path_choice
+    elif chase_visible:
         target_choice = raw_path_choice
     else:
         target_choice = get_stable_path(
@@ -1549,11 +2182,15 @@ def analyse_drive(front_frame, back_frame=None):
     drive_mode = 'path'
     steering = 0.0
     green_hold_aligned = False
+    golden_lane_aligned = False
 
     if target_choice is not None:
         if target_choice.get('mode') == 'green' and abs(target_choice['target_x']) <= GREEN_HOLD_CENTER_BAND:
             steering = 0.0
             green_hold_aligned = True
+        elif target_choice.get('mode') == 'golden_lane' and current_lane == analyse_drive.golden_lane_target:
+            steering = 0.0
+            golden_lane_aligned = True
         elif target_choice['target_x'] > 0.0:
             steering = 1.0
         elif target_choice['target_x'] < 0.0:
@@ -1611,26 +2248,52 @@ def analyse_drive(front_frame, back_frame=None):
     debug_frame[lane_on_road > 0] = [255, 255, 0]
 
     if left_poly is not None and right_poly is not None:
-        prev_dividers = None
-        for roi_y in range(roi_height - 1, 0, -15):
-            fit_left_x = left_poly(roi_y)
-            fit_right_x = right_poly(roi_y)
-            road_width = fit_right_x - fit_left_x
-
+        reference_bounds = get_player_lane_reference_bounds(road_mask, width, height, roi_top, left_poly, right_poly)
+        if reference_bounds is not None:
+            effective_left_x, effective_right_x = reference_bounds
+            road_width = effective_right_x - effective_left_x
             if road_width > 20:
-                current_dividers = [
-                    int(fit_left_x + road_width * 0.20),
-                    int(fit_left_x + road_width * 0.40),
-                    int(fit_left_x + road_width * 0.60),
-                    int(fit_left_x + road_width * 0.80)
+                divider_xs = [
+                    int(effective_left_x + road_width * 0.00),
+                    int(effective_left_x + road_width * 0.20),
+                    int(effective_left_x + road_width * 0.40),
+                    int(effective_left_x + road_width * 0.60),
+                    int(effective_left_x + road_width * 0.80),
+                    int(effective_left_x + road_width * 1.00)
                 ]
+                overlay_start_y = roi_top + max(0, roi_height - 1 - LANE_OVERLAY_START_OFFSET)
+                straight_end_y = max(roi_top, overlay_start_y - LANE_OVERLAY_STRAIGHT_HEIGHT)
 
-                screen_y = roi_top + roi_y
+                for divider_x in divider_xs:
+                    cv2.line(debug_frame, (divider_x, overlay_start_y), (divider_x, straight_end_y), (200, 200, 200), 1)
 
-                if prev_dividers:
-                    for i in range(4):
-                        cv2.line(debug_frame, (prev_dividers[i], screen_y + 15), (current_dividers[i], screen_y), (200, 200, 200), 1)
-                prev_dividers = current_dividers
+                prev_dividers = divider_xs
+                prev_screen_y = straight_end_y
+                start_roi_y = max(0, straight_end_y - roi_top)
+
+                for roi_y in range(start_roi_y - 15, 0, -15):
+                    fit_left_x = left_poly(roi_y)
+                    fit_right_x = right_poly(roi_y)
+                    effective_curve_left_x, effective_curve_right_x = get_player_effective_lane_bounds(fit_left_x, fit_right_x)
+                    curve_width = effective_curve_right_x - effective_curve_left_x
+                    if curve_width <= 20:
+                        continue
+
+                    current_dividers = [
+                        int(effective_curve_left_x + curve_width * 0.00),
+                        int(effective_curve_left_x + curve_width * 0.20),
+                        int(effective_curve_left_x + curve_width * 0.40),
+                        int(effective_curve_left_x + curve_width * 0.60),
+                        int(effective_curve_left_x + curve_width * 0.80),
+                        int(effective_curve_left_x + curve_width * 1.00)
+                    ]
+                    screen_y = roi_top + roi_y
+
+                    for i in range(6):
+                        cv2.line(debug_frame, (prev_dividers[i], prev_screen_y), (current_dividers[i], screen_y), (200, 200, 200), 1)
+
+                    prev_dividers = current_dividers
+                    prev_screen_y = screen_y
 
     road_overlay = cv2.cvtColor(road_mask, cv2.COLOR_GRAY2BGR)
     road_overlay[:, :, 0] = 0
@@ -1704,6 +2367,18 @@ def analyse_drive(front_frame, back_frame=None):
             cv2.LINE_AA
         )
 
+    if golden_lane_aligned:
+        cv2.putText(
+            debug_frame,
+            f"golden lane {analyse_drive.golden_lane_target} aligned -> hold",
+            (10, 172),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.50,
+            (0, 215, 255),
+            2,
+            cv2.LINE_AA
+        )
+
     if focused_reds:
         red_front_band_y = min(token['rect'][1] for token in focused_reds)
         cv2.line(debug_frame, (0, red_front_band_y), (width - 1, red_front_band_y), (255, 0, 255), 2)
@@ -1747,6 +2422,17 @@ def analyse_drive(front_frame, back_frame=None):
         cv2.LINE_AA
     )
 
+    cv2.putText(
+        debug_frame,
+        f"current lane={current_lane}",
+        (10, 52 if target_choice is None else 76),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.52,
+        (220, 220, 220),
+        2,
+        cv2.LINE_AA
+    )
+
     if edge_escape_choice is not None:
         cv2.putText(
             debug_frame,
@@ -1782,6 +2468,23 @@ def analyse_drive(front_frame, back_frame=None):
             2,
             cv2.LINE_AA
         )
+
+    if golden_lane_active:
+        cv2.putText(
+            debug_frame,
+            f"GOLDEN LANE active lane={analyse_drive.golden_lane_target} current={current_lane} {golden_lane_time_left:.1f}s",
+            (max(10, width - 340), 56),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.52,
+            (0, 215, 255),
+            2,
+            cv2.LINE_AA
+        )
+
+    golden_debug = getattr(detect_golden_lane_number, "debug", None)
+    if golden_debug is not None:
+        rx, ry, rw, rh = golden_debug['roi_rect']
+        cv2.rectangle(debug_frame, (rx, ry), (rx + rw, ry + rh), (0, 215, 255), 1)
 
     if police_car is not None:
         x, y, w, h = police_car['rect']
