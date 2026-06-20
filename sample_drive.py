@@ -58,6 +58,12 @@ CHASE_BACK_MIN_AREA = 28
 CHASE_BACK_FAR_MIN_AREA = 4
 CHASE_BACK_NEAR_MIN_AREA = 55
 CHASE_BACK_NEAR_MIN_Y = 0.46
+CHASE_BACK_MIN_BOX_WIDTH = 8
+CHASE_BACK_MIN_BOX_HEIGHT = 6
+CHASE_BACK_FINAL_MIN_WIDTH = 14
+CHASE_BACK_FINAL_MIN_HEIGHT = 10
+CHASE_BACK_FAR_MIN_WIDTH = 4
+CHASE_BACK_FAR_MIN_HEIGHT = 3
 CHASE_BACK_ROI_TOP = 0.42
 CHASE_BACK_ROI_BOTTOM = 0.94
 CHASE_BACK_BLUE_MIN = 70
@@ -554,6 +560,16 @@ def chasing_min_area_for_y(norm_y):
     return CHASE_BACK_FAR_MIN_AREA + ((CHASE_BACK_MIN_AREA - CHASE_BACK_FAR_MIN_AREA) * near_weight)
 
 
+def chasing_min_width_for_y(norm_y):
+    near_weight = clamp((norm_y - 0.20) / 0.70, 0.0, 1.0)
+    return CHASE_BACK_FAR_MIN_WIDTH + ((CHASE_BACK_FINAL_MIN_WIDTH - CHASE_BACK_FAR_MIN_WIDTH) * near_weight)
+
+
+def chasing_min_height_for_y(norm_y):
+    near_weight = clamp((norm_y - 0.20) / 0.70, 0.0, 1.0)
+    return CHASE_BACK_FAR_MIN_HEIGHT + ((CHASE_BACK_FINAL_MIN_HEIGHT - CHASE_BACK_FAR_MIN_HEIGHT) * near_weight)
+
+
 def police_min_area_for_y(norm_y):
     near_weight = clamp((norm_y - 0.14) / 0.68, 0.0, 1.0)
     return POLICE_FAR_MIN_AREA + ((POLICE_MIN_AREA - POLICE_FAR_MIN_AREA) * near_weight)
@@ -602,6 +618,10 @@ def detect_chasing_car(back_frame):
         center_y = y + (h / 2.0)
         norm_y = center_y / max(float(roi.shape[0]), 1.0)
         if area < chasing_min_area_for_y(norm_y):
+            continue
+        if w < CHASE_BACK_MIN_BOX_WIDTH or h < CHASE_BACK_MIN_BOX_HEIGHT:
+            continue
+        if w < chasing_min_width_for_y(norm_y) or h < chasing_min_height_for_y(norm_y):
             continue
 
         aspect_ratio = w / max(float(h), 1.0)
