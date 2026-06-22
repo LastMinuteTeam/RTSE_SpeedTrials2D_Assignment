@@ -176,16 +176,8 @@ LANE_FIT_BLEND = 0.35
 GOLDEN_EVENT_DURATION = 5.0
 GOLDEN_TEXT_ROI_TOP = 0.00
 GOLDEN_TEXT_ROI_BOTTOM = 0.040
-GOLDEN_TEXT_ROI_LEFT = 0.00
-GOLDEN_TEXT_ROI_RIGHT = 1.00
-GOLDEN_TEXT_MIN_COMPONENT_AREA = 12
 GOLDEN_TEXT_MIN_HEIGHT = 6
-GOLDEN_TEXT_MATCH_THRESHOLD = 0.26
 GOLDEN_TEXT_BLACK_MAX_VALUE = 110
-GOLDEN_TEXT_SEARCH_LEFT = 0.36
-GOLDEN_TEXT_SEARCH_RIGHT = 0.78
-GOLDEN_DIGIT_SLOT_LEFT = 0.425
-GOLDEN_DIGIT_SLOT_RIGHT = 0.505
 GOLDEN_LANE_PRIORITY_BONUS = 0.20
 GOLDEN_OCR_INTERVAL = 0.75
 GOLDEN_BANNER_MIN_YELLOW_RATIO = 0.55
@@ -950,142 +942,6 @@ def get_player_lane_reference_bounds(road_mask, frame_width, frame_height, roi_t
     return get_player_effective_lane_bounds(bounds[0], bounds[1])
 
 
-def build_golden_lane_templates():
-    patterns = {
-        1: [
-            "000111000000",
-            "001111000000",
-            "000111000000",
-            "000111000000",
-            "000111000000",
-            "000111000000",
-            "000111000000",
-            "000111000000",
-            "000111000000",
-            "000111000000",
-            "000111000000",
-            "000111000000",
-            "000111000000",
-            "000111000000",
-            "000111000000",
-            "000111000000",
-            "001111100000",
-            "001111100000",
-        ],
-        2: [
-            "001111110000",
-            "011111111000",
-            "111000111100",
-            "000000111100",
-            "000000111000",
-            "000001110000",
-            "000011100000",
-            "000111000000",
-            "001110000000",
-            "011100000000",
-            "111000000000",
-            "111000000000",
-            "111000000000",
-            "111000000000",
-            "111000000000",
-            "111111111100",
-            "111111111100",
-            "111111111100",
-        ],
-        3: [
-            "001111110000",
-            "011111111000",
-            "111000111100",
-            "000000111100",
-            "000000111000",
-            "000001110000",
-            "000111100000",
-            "000111100000",
-            "000011110000",
-            "000000111000",
-            "000000011100",
-            "000000011100",
-            "000000011100",
-            "000000111100",
-            "111000111100",
-            "011111111000",
-            "001111110000",
-            "000111100000",
-        ],
-        4: [
-            "000001111000",
-            "000011111000",
-            "000111111000",
-            "001111111000",
-            "001110111000",
-            "011100111000",
-            "111000111000",
-            "111000111000",
-            "111000111000",
-            "111111111100",
-            "111111111100",
-            "000000111000",
-            "000000111000",
-            "000000111000",
-            "000000111000",
-            "000000111000",
-            "000001111100",
-            "000001111100",
-        ],
-        5: [
-            "111111111100",
-            "111111111100",
-            "111111111100",
-            "111000000000",
-            "111000000000",
-            "111000000000",
-            "111111110000",
-            "111111111000",
-            "111000111100",
-            "000000011100",
-            "000000011100",
-            "000000011100",
-            "000000011100",
-            "000000111100",
-            "111000111100",
-            "011111111000",
-            "001111110000",
-            "000111100000",
-        ],
-    }
-
-    templates = {}
-    for digit, rows in patterns.items():
-        array = np.array([[255 if ch == '1' else 0 for ch in row] for row in rows], dtype=np.uint8)
-        templates[digit] = array
-    return templates
-
-
-def match_digit_template(binary_digit, templates):
-    resized = cv2.resize(binary_digit, (12, 18), interpolation=cv2.INTER_NEAREST)
-    _, resized = cv2.threshold(resized, 127, 255, cv2.THRESH_BINARY)
-    best_digit = None
-    best_score = -1.0
-    resized_bool = resized > 0
-    for digit, template in templates.items():
-        template_bool = template > 0
-        intersection = np.logical_and(resized_bool, template_bool).sum()
-        union = np.logical_or(resized_bool, template_bool).sum()
-        if union == 0:
-            continue
-        iou = intersection / union
-
-        resized_fill = resized_bool.mean()
-        template_fill = template_bool.mean()
-        fill_penalty = abs(resized_fill - template_fill)
-
-        score = float(iou - (0.35 * fill_penalty))
-        if score > best_score:
-            best_score = score
-            best_digit = digit
-    return best_digit, float(best_score)
-
-
 def detect_golden_lane_number_ocr(frame):
     if pytesseract is None:
         return None
@@ -1184,8 +1040,7 @@ def detect_golden_lane_number_ocr(frame):
 
 
 def detect_golden_lane_number(frame):
-    if not hasattr(detect_golden_lane_number, "templates"):
-        detect_golden_lane_number.templates = build_golden_lane_templates()
+    if not hasattr(detect_golden_lane_number, "debug"):
         detect_golden_lane_number.debug = None
         detect_golden_lane_number.last_ocr_time = 0.0
         detect_golden_lane_number.last_ocr_result = None
@@ -1221,89 +1076,14 @@ def detect_golden_lane_number(frame):
     height, width = frame.shape[:2]
     roi_top = int(height * GOLDEN_TEXT_ROI_TOP)
     roi_bottom = int(height * GOLDEN_TEXT_ROI_BOTTOM)
-    roi_left = int(width * GOLDEN_TEXT_ROI_LEFT)
-    roi_right = int(width * GOLDEN_TEXT_ROI_RIGHT)
-    roi = frame[roi_top:roi_bottom, roi_left:roi_right]
-    if roi.size == 0:
-        detect_golden_lane_number.debug = None
-        return None
-
-    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    yellow_mask = cv2.inRange(hsv, np.array([15, 80, 140]), np.array([40, 255, 255]))
-    yellow_mask = cv2.morphologyEx(yellow_mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
-
-    dark_text_mask = cv2.inRange(gray, 0, GOLDEN_TEXT_BLACK_MAX_VALUE)
-    text_mask = cv2.bitwise_and(dark_text_mask, yellow_mask)
-    text_mask = cv2.morphologyEx(text_mask, cv2.MORPH_OPEN, np.ones((2, 1), np.uint8))
-    best = None
-    candidate_boxes = []
-    search_left = int(roi.shape[1] * 0.39)
-    search_right = int(roi.shape[1] * 0.49)
-    search_rect = (roi_left + search_left, roi_top, search_right - search_left, roi_bottom - roi_top)
-    window_width = max(8, int(roi.shape[1] * 0.022))
-    step = max(2, int(roi.shape[1] * 0.004))
-    target_center_x = roi.shape[1] * 0.443
-
-    for x0 in range(search_left, max(search_left + 1, search_right - window_width + 1), step):
-        x1 = x0 + window_width
-        window_mask = text_mask[:, x0:x1]
-        if np.count_nonzero(window_mask) < GOLDEN_TEXT_MIN_COMPONENT_AREA:
-            continue
-
-        row_activity = np.count_nonzero(window_mask, axis=1)
-        active_rows = np.where(row_activity >= 1)[0]
-        if active_rows.size == 0:
-            continue
-
-        col_activity = np.count_nonzero(window_mask, axis=0)
-        active_cols = np.where(col_activity >= 1)[0]
-        if active_cols.size == 0:
-            continue
-
-        bx0 = x0 + int(active_cols[0])
-        bx1 = x0 + int(active_cols[-1] + 1)
-        by0 = int(active_rows[0])
-        by1 = int(active_rows[-1] + 1)
-        bw = int(bx1 - bx0)
-        bh = int(by1 - by0)
-        area = int(np.count_nonzero(text_mask[by0:by1, bx0:bx1]))
-        if area < GOLDEN_TEXT_MIN_COMPONENT_AREA:
-            continue
-        if bw < 3 or bh < 8:
-            continue
-        if bw > max(14, int(roi.shape[1] * 0.020)):
-            continue
-        aspect_ratio = bw / max(float(bh), 1.0)
-        if aspect_ratio < 0.10 or aspect_ratio > 0.95:
-            continue
-
-        candidate_boxes.append((bx0 + roi_left, by0 + roi_top, bw, bh))
-        digit_patch = text_mask[by0:by1, bx0:bx1]
-        digit, score = match_digit_template(digit_patch, detect_golden_lane_number.templates)
-        if digit is None:
-            continue
-
-        center_x = bx0 + (bw * 0.5)
-        center_penalty = abs(center_x - target_center_x) / max(float(roi.shape[1]), 1.0)
-        weighted_score = float(score - (0.45 * center_penalty))
-
-        if weighted_score >= GOLDEN_TEXT_MATCH_THRESHOLD and (best is None or weighted_score > best['score']):
-            best = {
-                'lane': int(digit),
-                'score': weighted_score,
-                'raw_score': float(score),
-                'rect': (bx0 + roi_left, by0 + roi_top, bw, bh)
-            }
-
     detect_golden_lane_number.debug = {
-        'roi_rect': (roi_left, roi_top, roi_right - roi_left, roi_bottom - roi_top),
-        'search_rect': search_rect,
+        'roi_rect': (0, roi_top, width, roi_bottom - roi_top),
+        'search_rect': None,
         'phrase_rect': None,
-        'candidate_boxes': candidate_boxes,
-        'best_rect': None if best is None else best['rect'],
-        'best_lane': None if best is None else best['lane'],
-        'best_score': None if best is None else best['score'],
+        'candidate_boxes': [],
+        'best_rect': None,
+        'best_lane': None,
+        'best_score': None,
         'ocr_text': (
             detect_golden_lane_number.last_ocr_debug_text
             if detect_golden_lane_number.last_ocr_debug_text is not None
@@ -1312,10 +1092,7 @@ def detect_golden_lane_number(frame):
         'ocr_available': getattr(detect_golden_lane_number_ocr, 'available', False),
         'ocr_active': False,
     }
-
-    if best is None:
-        return None
-    return best
+    return None
 
 
 def clean_color_mask(mask):
