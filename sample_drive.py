@@ -155,17 +155,22 @@ GRAY_MAX_VALUE = 220
 GRAY_MIN_COMPACTNESS = 0.18
 GRAY_MAX_FILL_RATIO = 0.98
 GREEN_MIN_Y = 0.02
-GREEN_MAX_OFFSET = 0.80
+GREEN_MAX_OFFSET = 0.90
+
+RED_COLLECT_MAX_OFFSET = 0.80
+GREEN_MIN_SCORE_NORMAL = 0.07
+GREEN_MIN_SCORE_EVENT = 0.10
 HAZARD_OVERRIDE_THREAT = 0.16
 ROAD_LEFT_LIMIT = -0.88
 ROAD_RIGHT_LIMIT = 0.88
 HAZARD_CLEARANCE = 0.14
+RED_EXTRA_CLEARANCE = 0.06
 HAZARD_GAP_GREEN_BONUS = 0.35
 HAZARD_FRONT_PRIORITY_WINDOW = 0.16
 HAZARD_SIZE_PRIORITY_WEIGHT = 1.20
 GREEN_FRONT_PRIORITY_WINDOW = 0.12
 GREEN_SIZE_PRIORITY_WEIGHT = 0.75
-GREEN_FRONT_PRIORITY_ADVANTAGE = 0.04
+GREEN_FRONT_PRIORITY_ADVANTAGE = 0.08
 PATH_RELEASE_CENTER_THRESHOLD = 0.15
 GREEN_HOLD_CENTER_BAND = 0.06
 PATH_LOST_TIMEOUT = 0.75
@@ -1262,7 +1267,7 @@ def find_tokens(frame, road_mask, roi_top, lane_left_norm, lane_right_norm):
     return token_info
 
 
-def choose_green_target(tokens, path_center):
+def choose_green_target(tokens, path_center, min_score=GREEN_MIN_SCORE_EVENT):
     candidate_targets = []
     best_priority_score = None
 
@@ -1298,7 +1303,7 @@ def choose_green_target(tokens, path_center):
     best_target = best_entry['token']
     best_score = best_entry['score']
 
-    if best_score < 0.10:
+    if best_score < min_score:
         return None
 
     return {
@@ -1412,7 +1417,7 @@ def choose_red_target(tokens, path_center):
 
         closeness = clamp((token['norm_y'] - HAZARD_MIN_Y) / (1.0 - HAZARD_MIN_Y), 0.0, 1.0)
         center_score = center_line_overlap(token['norm_x'], path_center)
-        wide_alignment = 1.0 - clamp(abs(token['norm_x'] - path_center) / GREEN_MAX_OFFSET, 0.0, 1.0)
+        wide_alignment = 1.0 - clamp(abs(token['norm_x'] - path_center) / RED_COLLECT_MAX_OFFSET, 0.0, 1.0)
         score = (closeness * 1.55) + (center_score * 1.10) + (wide_alignment * 0.35)
         priority_score = token['norm_y'] + (token.get('norm_w', 0.0) * HAZARD_SIZE_PRIORITY_WEIGHT)
 
@@ -1507,7 +1512,7 @@ def choose_hazard_avoidance(tokens, path_center, avoid_red=True):
 
             closeness = clamp((token['norm_y'] - HAZARD_MIN_Y) / (1.0 - HAZARD_MIN_Y), 0.0, 1.0)
             if token_type == 'red':
-                token_weight = 1.60
+                token_weight = 1.90
             elif token_type == 'yellow':
                 token_weight = 1.15
             else:
@@ -1515,7 +1520,8 @@ def choose_hazard_avoidance(tokens, path_center, avoid_red=True):
             threat = (closeness * 1.35) * path_overlap * token_weight
             strongest_threat = max(strongest_threat, threat)
 
-            interval_half = max((token.get('norm_w', 0.10) * 0.55) + HAZARD_CLEARANCE, 0.08)
+            clearance = HAZARD_CLEARANCE + (RED_EXTRA_CLEARANCE if token_type == 'red' else 0.0)
+            interval_half = max((token.get('norm_w', 0.10) * 0.55) + clearance, 0.08)
             left_bound = clamp(token['norm_x'] - interval_half, ROAD_LEFT_LIMIT, ROAD_RIGHT_LIMIT)
             right_bound = clamp(token['norm_x'] + interval_half, ROAD_LEFT_LIMIT, ROAD_RIGHT_LIMIT)
             priority_score = token['norm_y'] + (token.get('norm_w', 0.0) * HAZARD_SIZE_PRIORITY_WEIGHT)
@@ -1894,8 +1900,10 @@ def analyse_drive(front_frame, back_frame=None):
             use_player_bounds=True
         )
         edge_escape_choice = check_edge_lane_escape(tokens, player_lane_norm_x, road_mask, width, height, roi_top, left_poly, right_poly)
-        green_choice = choose_green_target(tokens, path_center)
-        hazard_choice = choose_hazard_avoidance(tokens, path_center)
+        normal_mode = not (police_active or golden_lane_active or chase_visible)
+        green_min_score = GREEN_MIN_SCORE_NORMAL if normal_mode else GREEN_MIN_SCORE_EVENT
+        green_choice = choose_green_target(tokens, path_center, min_score=green_min_score)
+        hazard_choice = choose_hazard_avoidance(tokens, path_center, avoid_red=not police_active)
         golden_lane_choice = choose_golden_lane_target(
             analyse_drive.golden_lane_target,
             current_lane,
